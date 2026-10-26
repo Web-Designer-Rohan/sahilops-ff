@@ -24,15 +24,13 @@ from Crypto.Util.Padding import pad
 from protobuf_decoder.protobuf_decoder import Parser
 from core.message_ids import MESSAGE_ID_TO_NAME
 from core import thunderFF_pb2
+from core import storage
 
 from dashboard.dashboard_server import bot_state, start_web_dashboard
 
 # ═══════════════════════════ CONFIG ═══════════════════════════
 WEB_HOST = os.environ.get("SAHILOPS_HOST", "127.0.0.1")
 WEB_PORT = 20333
-ACCOUNTS_FILE = os.path.join(BASE_DIR, "accounts.json")
-TOKEN_CACHE_FILE = os.path.join(BASE_DIR, "token_cache.json")
-DEVICES_FILE = os.path.join(BASE_DIR, "devices.json")
 TOKEN_CACHE_TTL = 4500
 
 START_MATCH_INTERVAL    = 4.0
@@ -98,8 +96,7 @@ TEAM_HEARTBEAT_INTERVAL = 3.0
 TEAM_IDLE_ITERS_TEAM    = 1800
 TEAM_MEMBER_START_DELAY = 20.0
 TEAM_FINAL_WAIT         = 8.0
-TEAM_SIZE = 4
-TEAM_READY_DELAY = 5.0
+TEAM_READY_DELAY        = 5.0
 _accept_friend_request = True
 DEBUG_TEAM_PACKETS      = True
 
@@ -129,14 +126,12 @@ def bypass_human_reconnect_delay(attempt):
 
 # ═══════════════════════════ DEVICE ═══════════════════════════
 def get_device_for_account(account_identifier):
-    devices = {}
-    if os.path.exists(DEVICES_FILE):
-        try:
-            with open(DEVICES_FILE, "r", encoding="utf-8") as f:
-                devices = json.load(f)
-        except Exception: pass
     key = str(account_identifier)
-    if key in devices: return devices[key]
+    try:
+        cached = storage.device_get(key)
+        if cached: return cached
+    except Exception as e:
+        print_warning(f"[DB] device read failed: {e}")
     dev_list = [
         ("Samsung", "SM-G998B", "Adreno (TM) 660", "Android OS 12 / API-31"),
         ("Xiaomi", "2201122G", "Adreno (TM) 730", "Android OS 13 / API-33"),
@@ -155,11 +150,10 @@ def get_device_for_account(account_identifier):
         "processor_details": f"ARM64 FP ASIMD AES | {random.randint(2200, 3200)} | {random.randint(6, 12)}",
         "client_ip": f"{random.randint(103, 223)}.{random.randint(10, 250)}.{random.randint(10, 250)}.{random.randint(10, 250)}",
     }
-    devices[key] = dev
     try:
-        with open(DEVICES_FILE, "w", encoding="utf-8") as f:
-            json.dump(devices, f, indent=2)
-    except Exception: pass
+        storage.device_set(key, dev)
+    except Exception as e:
+        print_warning(f"[DB] device save failed: {e}")
     return dev
 
 # ═══════════════════════════ DNS ═══════════════════════════
@@ -337,49 +331,18 @@ _token_cache_memo = {}
 _token_cache_memo_time = 0.0
 _TOKEN_CACHE_MEMO_TTL = 5.0
 
-def _json_serializer(obj):
-    if isinstance(obj, (bytes, bytearray)): return {"__bytes_hex__": bytes(obj).hex()}
-    raise TypeError(f"not serializable: {type(obj)}")
-
-def _json_deserializer(obj):
-    if isinstance(obj, dict):
-        if "__bytes_hex__" in obj and len(obj) == 1:
-            try: return bytes.fromhex(obj["__bytes_hex__"])
-            except Exception: return b""
-        return {k: _json_deserializer(v) for k, v in obj.items()}
-    if isinstance(obj, list): return [_json_deserializer(x) for x in obj]
-    return obj
-
 def _load_token_cache():
     global _token_cache_memo, _token_cache_memo_time
     now = time.time()
     if _token_cache_memo and (now - _token_cache_memo_time) < _TOKEN_CACHE_MEMO_TTL:
         return _token_cache_memo
-    if not os.path.exists(TOKEN_CACHE_FILE): return {}
     try:
-        with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-        if not content: return {}
-        data = json.loads(content)
-        if not isinstance(data, dict): raise ValueError("root must be dict")
-        parsed = _json_deserializer(data)
-        _token_cache_memo = parsed; _token_cache_memo_time = now
-        return parsed
+        parsed = storage.tokens_all()
     except Exception as e:
-        print_error(f"Token cache corrupt -> delete: {e}")
-        try: os.remove(TOKEN_CACHE_FILE)
-        except Exception: pass
+        print_error(f"Token cache load: {e}")
         return {}
-
-def _save_token_cache(cache):
-    global _token_cache_memo, _token_cache_memo_time
-    try:
-        tmp = TOKEN_CACHE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, default=_json_serializer)
-        os.replace(tmp, TOKEN_CACHE_FILE)
-        _token_cache_memo = cache; _token_cache_memo_time = time.time()
-    except Exception as e: print_error(f"Cache save: {e}")
+    _token_cache_memo = parsed; _token_cache_memo_time = now
+    return parsed
 
 def cache_get(uid):
     cache = _load_token_cache()
@@ -395,13 +358,14 @@ def cache_get(uid):
 def cache_set(uid, data):
     cache = _load_token_cache()
     e = dict(data); e["cached_at"] = time.time()
-    cache[str(uid)] = e; _save_token_cache(cache)
+    cache[str(uid)] = e
+    storage.token_set(str(uid), e)
     print_success(f"[CACHE] Saved UID {uid}")
 
 def cache_invalidate(uid):
     cache = _load_token_cache()
-    if str(uid) in cache:
-        del cache[str(uid)]; _save_token_cache(cache)
+    if cache.pop(str(uid), None) is not None:
+        storage.token_delete(str(uid))
 
 def _update_cache_profile(data, level, exp):
     try:
@@ -409,12 +373,13 @@ def _update_cache_profile(data, level, exp):
         if data.get('auth_uid'): keys.append(str(data['auth_uid']))
         if data.get('auth_token'): keys.append(f"tok_{data['auth_token'][:20]}")
         if not keys: return
-        cache = _load_token_cache(); ch = False
+        cache = _load_token_cache()
         for k in keys:
-            if k in cache and isinstance(cache[k], dict):
-                cache[k]['level'] = level; cache[k]['exp'] = exp; ch = True
-        if ch: _save_token_cache(cache)
-    except Exception: pass
+            if isinstance(cache.get(k), dict):
+                cache[k]['level'] = level; cache[k]['exp'] = exp
+                storage.token_set(k, cache[k])
+    except Exception as e:
+        print_warning(f"[CACHE] profile update failed: {e}")
 
 # ═══════════════════════════ ENCRYPTION ═══════════════════════════
 async def aes_encrypt(payload, key, iv):
@@ -831,8 +796,12 @@ BR_HEX = (
     "01050804108103a20105080510c001a20105081d10cc01a2010408161078a20105080e10af01a201020815"
 )
 
-async def start_game_battle_royale(region, client_version, writer, key, iv):
-    packet = bytes.fromhex(BR_HEX)
+def apply_region_override(packet, region, client_version=None):
+    """Rewrite the StartMatch region (and optional version) in a BR payload.
+
+    Returns the packet unchanged if it cannot be parsed; the caller keeps the
+    original protocol bytes rather than sending a half-mutated message.
+    """
     reg = str(region).upper() if region else "BD"
     try:
         proto = thunderFF_pb2.StartMatch(); proto.ParseFromString(packet)
@@ -843,9 +812,15 @@ async def start_game_battle_royale(region, client_version, writer, key, iv):
             proto.main.region_list.add().region = reg
         if client_version:
             proto.main.client_version.remote_version = str(client_version)
-        packet = proto.SerializeToString()
+        return proto.SerializeToString()
     except Exception as e:
         print_warning(f"[BR] region/version override failed: {e}")
+        return packet
+
+
+async def start_game_battle_royale(region, client_version, writer, key, iv):
+    reg = str(region).upper() if region else "BD"
+    packet = apply_region_override(bytes.fromhex(BR_HEX), reg, client_version)
     enc = (await aes_encrypt(packet, key, iv)).hex()
     plen = len(enc) // 2
     hl = hex(plen)[2:]
@@ -1355,7 +1330,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                                 _, nr = await layouts_from_mask(match_code)
                                 a = await build_packet(0x68, nr, 0, 2, None, 1, b"\x01\x00", udp_key_bytes)
                                 await loop.sock_sendto(sock, a, saddr)
-                            except Exception: pass
+                            except Exception as e:
+                                print_warning(f"[MATCH #{match_index}] cmd101 reply failed: {e}")
                             continue
                         if pt in ["ACK", "PING", "HELLO", "JOIN_MATCH"]:
                             if pt == "HELLO" and ack_state == "waiting_for_hello_reply":
@@ -1386,7 +1362,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                         try:
                             hp = await build_hello_packet(f"{account_id}_2585", udp_key_bytes, match_code)
                             await loop.sock_sendto(sock, bytes.fromhex(hp), (rip, port))
-                        except Exception: pass
+                        except Exception as e:
+                            print_warning(f"[MATCH #{match_index}] hello resend failed: {e}")
                         last_activity = time.time()
                     if (time.time() - t0) > 25.0:
                         print_warning(f"[MATCH #{match_index}] Handshake timeout"); break
@@ -1408,8 +1385,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
             try: bot_state.increment_match(uid_str)
             except Exception: pass
             if on_match_complete:
-                try: asyncio.create_task(on_match_complete())
-                except Exception: pass
+                try: bot_state.spawn(on_match_complete())
+                except Exception as e: print_warning(f"[MATCH] post-match task: {e}")
         anti_stop.set(); move_stop.set()
         for t in (anti_task, move_task):
             if t:
@@ -1434,7 +1411,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
 
 async def start_startup_safe(fn):
     try: await fn()
-    except Exception: pass
+    except Exception as e:
+        print_warning(f"[MATCH] startup send failed: {e}")
 
 # ═══════════════════════════ FRIEND REQUEST ═══════════════════════════
 async def _process_social_packet(raw_bytes, account_data, tag="MAIN"):
@@ -1494,8 +1472,12 @@ async def _process_social_packet(raw_bytes, account_data, tag="MAIN"):
                 r = await s.post(url, headers=hdrs, content=payload)
                 if r.status_code == 200 and len(r.content) > 0:
                     print_success(f"[FRIEND-{tag}] ✅ {target}")
-        except Exception: pass
-    except Exception: pass
+                else:
+                    print_warning(f"[FRIEND-{tag}] HTTP {r.status_code} for {target}")
+        except Exception as e:
+            print_warning(f"[FRIEND-{tag}] confirm failed for {target}: {e}")
+    except Exception as e:
+        print_warning(f"[FRIEND-{tag}] parse failed: {e}")
 
 def _wrap_manual(inner):
     try:
@@ -2192,7 +2174,8 @@ async def informational(addrs, starter_packet, key, iv, region="ID", max_reconne
                 ka = await send_keep_alive(region)
                 if ka and not writer.is_closing():
                     writer.write(ka); await asyncio.wait_for(writer.drain(), timeout=3)
-            except Exception: pass
+            except Exception as e:
+                print_warning(f"[INFO] keepalive failed: {e}")
             async def info_ka():
                 ka = await send_keep_alive(region)
                 while True:
@@ -2474,13 +2457,11 @@ async def account_loop_token(token):
             await asyncio.sleep(10)
 
 def load_accounts():
-    accounts = []
-    if os.path.exists(ACCOUNTS_FILE):
-        try:
-            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list): accounts = data
-        except Exception as e: print_error(f"load: {e}")
+    try:
+        accounts = storage.list_accounts()
+    except Exception as e:
+        print_error(f"accounts load: {e}")
+        accounts = []
     if not accounts and FALLBACK_UID and FALLBACK_PASSWORD:
         accounts.append({"uid": FALLBACK_UID, "password": FALLBACK_PASSWORD})
     return accounts
@@ -2582,8 +2563,9 @@ async def main():
         print_info(f"  heartbeat={TEAM_HEARTBEAT_INTERVAL}s | final_wait={TEAM_FINAL_WAIT}s")
     print_colored("=" * 60, Colors.CYAN)
 
+    runner = None
     try:
-        await start_web_dashboard(host=WEB_HOST, port=WEB_PORT)
+        runner = await start_web_dashboard(host=WEB_HOST, port=WEB_PORT)
         shown = "localhost" if WEB_HOST in ("127.0.0.1", "0.0.0.0", "::1", "::") else WEB_HOST
         print_success(f"Dashboard: http://{shown}:{WEB_PORT} (bind {WEB_HOST})")
     except Exception as e: print_error(f"Dashboard: {e}")
@@ -2596,7 +2578,7 @@ async def main():
 
     accounts = load_accounts()
     if not accounts:
-        print_warning(f"No accounts in {ACCOUNTS_FILE}. Add via dashboard.")
+        print_warning(f"No accounts in {storage.DB_PATH}. Add via dashboard.")
     for acc in accounts:
         _start_worker(acc)
 
@@ -2604,8 +2586,22 @@ async def main():
         while True: await asyncio.sleep(1)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print_warning("Shutting down...")
-        for t in list(bot_state.account_workers.values()): t.cancel()
-        await asyncio.gather(*bot_state.account_workers.values(), return_exceptions=True)
+    finally:
+        workers = [t for t in bot_state.account_workers.values() if not t.done()]
+        bot_state.account_workers.clear()
+        for t in workers: t.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+        await bot_state.drain()
+        if runner is not None:
+            try:
+                await runner.cleanup()
+            except Exception as e:
+                print_warning(f"Dashboard shutdown: {e}")
+        try:
+            storage.close()
+        except Exception as e:
+            print_warning(f"Storage close: {e}")
         print_success("Closed.")
 
 if __name__ == "__main__":

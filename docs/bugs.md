@@ -5,9 +5,10 @@ Legend: **C** = confirmed by tracing and/or reproducing the code path; **R** = r
 
 > **SahilOps status:** bugs #1 (region/version override), #2 (pause/resume
 > sockets), #3 (restart), #4 (squads below four accounts), #5 (automatic clan
-> join), and #6 (network binding) are fixed in the current build. The duplicate
-> `handle_index` handler (#18) was also removed. The table and notes below keep
-> the original audit wording; paths now live under `core/` and `dashboard/`.
+> join), #6 (network binding + control-panel auth + secret filtering), #13
+> (fake API-key auth), and #18 (duplicate `handle_index`) are fixed in the
+> current build. The table and notes below keep the original audit wording;
+> paths now live under `core/` and `dashboard/`.
 
 ## Confirmed bugs
 
@@ -124,9 +125,16 @@ read account metadata from `/api/stats`, and trigger clan joins with all cached
 tokens. (The `token` field in account records is usually `""` because `app.py`
 never passes it to `register_account`, but the control surface is still wide open.)
 
-**Status: fixed for local use.** `WEB_HOST` now defaults to `127.0.0.1`;
-operators who need LAN access must opt in with `SAHILOPS_HOST=0.0.0.0`.
-Adding an explicit session token remains a recommendation for that case.
+**Status: fixed.** `WEB_HOST` defaults to `127.0.0.1`, and an aiohttp middleware
+now rejects every state-changing request (`POST`/`PUT`/`PATCH`/`DELETE`) that does
+not carry the control-panel key in the `X-API-Key` header (constant-time compare).
+That covers account add/delete/refresh/restart, pause, pause-all, log clearing,
+and `/api/clanjoin`, so an unauthenticated caller can no longer mutate anything.
+`/api/stats` and `/api/logs` strip secret fields (`token`, `access_token`,
+`password`, AES keys/IV, session keys, credentials) recursively and scrub JWT
+and `key=value` shapes from log text before serialising. Operators who expose
+the panel with `SAHILOPS_HOST=0.0.0.0` should also set a non-default
+`SAHILOPS_API_KEY`; the key is injected into the served page by the server.
 
 ### 7. Shipped session cache (Critical)
 
@@ -196,8 +204,13 @@ add `urllib3` explicitly.
 key is hard-coded in `index.html`. It provides no real protection (key in URL,
 logs, source) and is separate from the unprotected routes.
 
-**Fix:** remove the key or replace it with real auth; never put secrets in the
-front end.
+**Status: fixed.** The key is no longer hard-coded in the page or its URLs. The
+server injects the configured key into a `<meta>` tag when serving `index.html`,
+the UI sends it as `X-API-Key`, and `handle_api_guild_info` validates the header
+with `hmac.compare_digest` (the `?key=` form is still accepted for scripts).
+The default key remains `SAHILOPS`; override it with `SAHILOPS_API_KEY`.
+The trade-off is unchanged in kind: a browser that can load the page can read
+the key, so the key is an access gate for the local panel, not multi-user auth.
 
 ### 14. Version drift (Medium)
 

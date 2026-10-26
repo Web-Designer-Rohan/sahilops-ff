@@ -26,10 +26,51 @@ python -m core.app
 Open `http://localhost:20333` for the dashboard. It binds `127.0.0.1` by
 default; set `SAHILOPS_HOST=0.0.0.0` if you need access from another machine.
 
-Accounts can be placed in `accounts.json`:
+Accounts can be added from the dashboard, or placed in a legacy `accounts.json`
+that is imported once on first start:
 
 ```json
 [{"uid": "123456789", "password": "your-password"}]
+```
+
+## State storage
+
+Accounts, device fingerprints, and cached sessions live in `sahilops.db`
+(SQLite, WAL mode) instead of separate JSON files. The dashboard, the account
+generator, and the bot engine all go through `core/storage.py`, so they can no
+longer overwrite each other's writes. On first start the database imports
+`accounts.json`, `devices.json`, and `token_cache.json` once, then leaves them
+alone; those JSON files are no longer written.
+
+Set `SAHILOPS_DB=/path/to/file.db` to use a different database location.
+
+## Dashboard security
+
+Every state-changing route (`POST /api/account/*`, `POST /api/logs/clear`,
+`POST /api/clanjoin`) requires the control-panel key in the `X-API-Key` header;
+requests without it get `401`. `/api/guildinfo` accepts the same header (the
+legacy `?key=` form still works for scripts).
+
+The page served by the dashboard gets the key from the server at load time, so
+nothing is hard-coded in the HTML. The default key is `SAHILOPS`; set
+`SAHILOPS_API_KEY` to change it — do that before exposing the panel with
+`SAHILOPS_HOST=0.0.0.0`.
+
+`/api/stats` and `/api/logs` run every response through `redact_secrets()`:
+secret fields (`token`, `access_token`, `refresh_token`, `password`, `secret`,
+`api_key`, AES key/IV, session keys, credentials, cookies, `Authorization`) are
+dropped recursively, and JWT / `Bearer …` / `token=…` shapes are scrubbed from
+log text. Session data therefore never reaches the browser.
+
+## Tests
+
+The smoke test starts the real dashboard on `127.0.0.1:20333` and checks the
+storage layer, API-key enforcement on every write route, secret redaction,
+account add/pause/restart/delete, live log streaming, squad sizing, and the
+region-override patch:
+
+```bash
+.venv/bin/python tests/smoke_test.py
 ```
 
 ## Utilities
@@ -45,6 +86,6 @@ python utils/encode-id-clan.py # clan-id encoder
 
 - Python 3.10+ is required.
 - Generated protobuf modules need `protobuf>=6,<8`.
-- `token_cache.json`, `devices.json`, and `accounts.json` are runtime data and
-  are excluded from version control by default.
+- `sahilops.db`, `token_cache.json`, `devices.json`, and `accounts.json` are
+  runtime data and are excluded from version control by default.
 - Automating live game accounts can violate the game's terms of service.

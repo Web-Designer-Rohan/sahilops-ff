@@ -40,8 +40,11 @@ GETLOGIN_HOST_IND   = "client.ind.freefiremobile.com"
 GETLOGIN_HOST_OTHER = "clientbp.ggpolarbear.com"
 
 BASE_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ACCOUNTS_FILE = os.path.join(BASE_DIR, "accounts.json")
 LOG_FILE      = os.path.join(BASE_DIR, "generator.log")
+
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+from core import storage
 
 # Fixed value from working version — DO NOT randomize
 X_GA_SV = "1789636317"
@@ -687,27 +690,14 @@ def parse_getlogindata_response(data):
 # ══════════════════════════════════════════════════════════════════════════════
 #  JSON I/O
 # ══════════════════════════════════════════════════════════════════════════════
-def load_json(path, default=None):
-    if default is None: default = []
-    if not os.path.exists(path): return default
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        return d if isinstance(d, list) else default
-    except Exception:
-        return default
-
-
 def save_account(account: dict) -> bool:
     if not isinstance(account, dict): return False
     if not account.get("uid") or not account.get("password"): return False
-    with file_lock:
-        data = load_json(ACCOUNTS_FILE)
-        data.append(account)
-        tmp = ACCOUNTS_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, ACCOUNTS_FILE)
+    try:
+        storage.upsert_account(account)
+    except Exception as e:
+        logger.error(f"account save failed: {e}")
+        return False
     return True
 
 

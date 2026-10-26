@@ -6,8 +6,11 @@ Optimized for ultra-smooth operation, zero memory leaks, and dynamic multi-accou
 """
 
 import asyncio
+import hmac
+import html
 import json
 import os
+import re
 import sys
 import time
 from typing import Dict, List, Any, Optional
@@ -28,14 +31,78 @@ from core import ReqCLan_pb2
 from core import encode_id_clan_pb2
 from core import data_pb2
 from core import output_pb2
+from core import storage
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
-ACCOUNTS_FILE = os.path.join(BASE_DIR, "accounts.json")
-TOKEN_CACHE_FILE = os.path.join(BASE_DIR, "token_cache.json")
-DEVICES_FILE = os.path.join(BASE_DIR, "devices.json")
 GUILD_CACHE_FILE = os.path.join(BASE_DIR, "guild_exp_cache.json")
+
+# Control-panel key. Every state-changing request must present it in X-API-Key.
+API_KEY = os.environ.get("SAHILOPS_API_KEY", "SAHILOPS")
+API_KEY_HEADER = "X-API-Key"
+API_KEY_PLACEHOLDER = "__SAHILOPS_API_KEY__"
+WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+# Never send these back to a browser, whatever shape the source object has.
+SECRET_FIELDS = {
+    "token", "access_token", "auth_token", "refresh_token", "id_token",
+    "jwt", "jwt_token", "session_token", "session_key", "session_id",
+    "password", "passwd", "pwd", "secret", "client_secret", "api_key",
+    "aes_key", "key", "iv", "credential", "credentials", "cookie",
+    "authorization",
+}
+_SECRET_TEXT_PATTERNS = [
+    # Bare JWTs (header.payload.signature).
+    (re.compile(r"eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{2,}"), "[REDACTED_TOKEN]"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-+/=]+"), "Bearer [REDACTED]"),
+    (re.compile(r"(?i)\b(password|passwd|pwd|token|secret|api[_\-]?key|jwt)\b\s*[:=]\s*\S+"),
+     r"\1=[REDACTED]"),
+]
+
+
+def redact_text(value: str) -> str:
+    """Scrub token/password shapes out of free-form text (log lines, ids)."""
+    text = str(value)
+    for pattern, replacement in _SECRET_TEXT_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def redact_secrets(obj: Any) -> Any:
+    """Recursively drop secret fields and scrub secret-looking strings."""
+    if isinstance(obj, dict):
+        return {
+            k: redact_secrets(v)
+            for k, v in obj.items()
+            if str(k).strip().lower() not in SECRET_FIELDS
+        }
+    if isinstance(obj, (list, tuple, set)):
+        return [redact_secrets(v) for v in obj]
+    if isinstance(obj, str):
+        return redact_text(obj)
+    return obj
+
+
+def request_api_key(request: web.Request) -> str:
+    """Key from the X-API-Key header, falling back to the legacy ?key= query."""
+    return request.headers.get(API_KEY_HEADER) or request.query.get("key") or ""
+
+
+def api_key_ok(request: web.Request) -> bool:
+    provided = request_api_key(request)
+    return bool(provided) and hmac.compare_digest(provided, API_KEY)
+
+
+@web.middleware
+async def api_key_middleware(request: web.Request, handler):
+    """Reject every state-changing request that lacks the control-panel key."""
+    if request.method.upper() in WRITE_METHODS and not api_key_ok(request):
+        return web.json_response(
+            {"status": "error", "error": "Unauthorized: invalid or missing API key"},
+            status=401,
+        )
+    return await handler(request)
 
 OB = "OB55"
 KEY = bytes([89,103,38,116,99,37,68,69,117,104,54,37,90,99,94,56])
@@ -189,7 +256,8 @@ EXP_TABLE: Dict[int, int] = {
 }
 
 async def handle_get_stats(request: web.Request) -> web.Response:
-    accounts_data = list(bot_state.accounts.values())
+    # Copy before mutating: never touch the live account dicts from a read path.
+    accounts_data = [dict(acc) for acc in bot_state.accounts.values()]
     accounts_data.sort(key=lambda x: x.get("gained_exp", 0), reverse=True)
     uptime_sec = max(1, int(time.time() - bot_state.start_time))
     total_gained = bot_state.total_gained_exp
@@ -201,7 +269,7 @@ async def handle_get_stats(request: web.Request) -> web.Response:
         acc["uptime_seconds"] = bot_state.get_account_uptime(uid_k)
         acc["is_paused"] = bot_state.is_paused(uid_k)
 
-    return web.json_response({
+    return web.json_response(redact_secrets({
         "total_accounts": len(bot_state.accounts),
         "total_matches": bot_state.total_matches,
         "total_matches_started": bot_state.total_matches_started,   # 🔥 NEW
@@ -211,7 +279,7 @@ async def handle_get_stats(request: web.Request) -> web.Response:
         "accounts": accounts_data,
         "logs": bot_state.logs[-80:],
         "uptime": uptime_sec
-    })
+    }))
 
 def calculate_level_progress(level: int, current_exp: int) -> Dict[str, Any]:
     level = max(1, level)
@@ -251,6 +319,37 @@ class BotState:
         self.refresh_callbacks: Dict[str, Any] = {}
         self.account_credentials: Dict[str, Dict[str, Any]] = {}
         self.active_writers: Dict[str, set] = {}
+        self.background_tasks: set = set()
+
+    def spawn(self, coro) -> asyncio.Task:
+        """Track a fire-and-forget task so shutdown can await or cancel it."""
+        task = asyncio.create_task(coro)
+        self.background_tasks.add(task)
+        task.add_done_callback(self._background_done)
+        return task
+
+    def _background_done(self, task: asyncio.Task) -> None:
+        self.background_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self.log(f"Background task failed: {type(exc).__name__}: {exc}", "warning")
+
+    async def drain(self, timeout: float = 5.0) -> None:
+        """Await background tasks on shutdown, then cancel whatever is left."""
+        pending = [t for t in self.background_tasks if not t.done()]
+        if not pending:
+            return
+        done, still_pending = await asyncio.wait(pending, timeout=timeout)
+        for task in still_pending:
+            task.cancel()
+        if still_pending:
+            await asyncio.gather(*still_pending, return_exceptions=True)
+        for task in done:
+            if not task.cancelled() and task.exception() is not None:
+                self.log(f"Background task failed during drain: {task.exception()}", "warning")
+        self.background_tasks.clear()
 
     def register_writer(self, uid: str, writer):
         uid_str = str(uid)
@@ -437,9 +536,9 @@ class BotState:
             self.log(f"⏸ UID {target_key} ({nick}) matchmaking PAUSED (TCP socket disconnected).", "warning", target_key)
             if "on_pause_toggle" in self.refresh_callbacks:
                 try:
-                    asyncio.create_task(self.refresh_callbacks["on_pause_toggle"](target_key, True))
-                except Exception:
-                    pass
+                    self.spawn(self.refresh_callbacks["on_pause_toggle"](target_key, True))
+                except Exception as e:
+                    self.log(f"Pause callback failed for {target_key}: {e}", "warning", target_key)
         else:
             for c in candidates:
                 self.paused_accounts.discard(c)
@@ -454,9 +553,9 @@ class BotState:
             self.log(f"▶ UID {target_key} ({nick}) matchmaking RESUMED.", "success", target_key)
             if "on_pause_toggle" in self.refresh_callbacks:
                 try:
-                    asyncio.create_task(self.refresh_callbacks["on_pause_toggle"](target_key, False))
-                except Exception:
-                    pass
+                    self.spawn(self.refresh_callbacks["on_pause_toggle"](target_key, False))
+                except Exception as e:
+                    self.log(f"Resume callback failed for {target_key}: {e}", "warning", target_key)
 
         return is_now_paused
 
@@ -571,6 +670,8 @@ async def handle_index(request: web.Request) -> web.Response:
                 content = f.read()
         except Exception:
             pass
+    # Hand the configured key to the page instead of hard-coding it in the HTML.
+    content = content.replace(API_KEY_PLACEHOLDER, html.escape(API_KEY, quote=True))
     return web.Response(text=content, content_type="text/html", charset="utf-8")
 
 # ==================== CLAN JOIN API ENDPOINT (AIOHTTP) ====================
@@ -582,10 +683,9 @@ async def handle_api_clan_join(request: web.Request) -> web.Response:
             return web.json_response({'error': 'Clan ID is required'}, status=400)
         
         try:
-            with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
-                token_cache = json.load(f)
+            token_cache = storage.tokens_all()
         except Exception as e:
-            return web.json_response({'error': f'Failed to load token_cache.json: {str(e)}'}, status=500)
+            return web.json_response({'error': f'Failed to load token cache: {str(e)}'}, status=500)
 
         success_count = 0
         total_accounts = 0
@@ -646,22 +746,20 @@ async def handle_api_guild_info(request: web.Request) -> web.Response:
     try:
         clan_id = request.query.get('guild_id') or request.query.get('clan_uid') or request.query.get('clan_id')
         region = (request.query.get('region') or 'IND').upper()
-        api_key = request.query.get('key')
 
-        if not api_key or api_key != "SAHILOPS":
+        if not api_key_ok(request):
             return web.json_response({"error": "Unauthorized: Invalid or missing API key"}, status=401)
 
         if not clan_id:
             return web.json_response({"error": "guild_id is required"}, status=400)
 
         try:
-            with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
-                token_cache = json.load(f)
+            token_cache = storage.tokens_all()
         except Exception as e:
-            return web.json_response({"error": "Failed to load token_cache.json", "details": str(e)}, status=503)
+            return web.json_response({"error": "Failed to load token cache", "details": str(e)}, status=503)
 
         if not token_cache:
-            return web.json_response({"error": "token_cache.json is empty"}, status=503)
+            return web.json_response({"error": "token cache is empty"}, status=503)
 
         clan_data = fetch_single_clan(clan_id, region, token_cache)
         if "error" in clan_data:
@@ -704,14 +802,6 @@ async def handle_api_guild_info(request: web.Request) -> web.Response:
 async def handle_add_account(request: web.Request) -> web.Response:
     try:
         data = await request.json()
-        accounts_file = ACCOUNTS_FILE
-        existing = []
-        if os.path.exists(accounts_file):
-            try:
-                with open(accounts_file, "r", encoding="utf-8") as f:
-                    existing = json.load(f)
-            except Exception:
-                existing = []
 
         if "uid" in data and "password" in data:
             uid = str(data["uid"]).strip()
@@ -727,8 +817,7 @@ async def handle_add_account(request: web.Request) -> web.Response:
                     pass
                 bot_state.account_workers.pop(uid, None)
 
-            existing = [acc for acc in existing if str(acc.get("uid", "")) != uid]
-            existing.append({"uid": uid, "password": pwd})
+            record = {"uid": uid, "password": pwd}
             identifier = uid
 
         elif "token" in data:
@@ -746,20 +835,21 @@ async def handle_add_account(request: web.Request) -> web.Response:
                         pass
                     bot_state.account_workers.pop(k, None)
 
-            existing = [acc for acc in existing if acc.get("token", "") != token]
-            existing.append({"token": token})
+            record = {"token": token}
             identifier = f"Token_{token[:8]}..."
         else:
             return web.json_response({"status": "error", "error": "Invalid payload"})
 
-        with open(accounts_file, "w", encoding="utf-8") as f:
-            json.dump(existing, f, indent=2)
+        try:
+            storage.upsert_account(record)
+        except Exception as e:
+            return web.json_response({"status": "error", "error": f"Storage: {e}"})
 
         bot_state.log(f"New account added to rotation: {identifier}", "success")
         
         # Trigger dynamic worker launch in Main.py
         if "on_account_added" in bot_state.refresh_callbacks:
-            asyncio.create_task(bot_state.refresh_callbacks["on_account_added"](data))
+            bot_state.spawn(bot_state.refresh_callbacks["on_account_added"](data))
 
         return web.json_response({"status": "ok"})
     except Exception as e:
@@ -813,80 +903,52 @@ async def handle_delete_account(request: web.Request) -> web.Response:
                 if t:
                     target_tokens.add(str(t))
 
-        # Also clean token_cache.json if entries match
-        token_cache_file = TOKEN_CACHE_FILE
-        if os.path.exists(token_cache_file):
-            try:
-                with open(token_cache_file, "r", encoding="utf-8") as f:
-                    tcache = json.load(f)
-                dirty_cache = False
-                for k, v in list(tcache.items()):
-                    k_str = str(k)
-                    v_acc_id = str(v.get("account_id", ""))
-                    v_auth_uid = str(v.get("auth_uid", ""))
-                    if k_str in candidate_ids or v_acc_id in candidate_ids or v_auth_uid in candidate_ids:
-                        candidate_ids.add(k_str)
-                        if v_acc_id:
-                            candidate_ids.add(v_acc_id)
-                        if v_auth_uid:
-                            candidate_ids.add(v_auth_uid)
-                        del tcache[k]
-                        dirty_cache = True
-                if dirty_cache:
-                    with open(token_cache_file, "w", encoding="utf-8") as f:
-                        json.dump(tcache, f, indent=2)
-            except Exception:
-                pass
+        # Also purge matching cached sessions
+        try:
+            for k, v in list(storage.tokens_all().items()):
+                k_str = str(k)
+                v_acc_id = str(v.get("account_id", ""))
+                v_auth_uid = str(v.get("auth_uid", ""))
+                if k_str in candidate_ids or v_acc_id in candidate_ids or v_auth_uid in candidate_ids:
+                    candidate_ids.add(k_str)
+                    if v_acc_id:
+                        candidate_ids.add(v_acc_id)
+                    if v_auth_uid:
+                        candidate_ids.add(v_auth_uid)
+                    storage.token_delete(k_str)
+        except Exception as e:
+            bot_state.log(f"Token cache cleanup failed for {req_uid or req_auth_uid}: {e}",
+                          "warning", req_uid or req_auth_uid)
 
-        # Remove from accounts.json
-        accounts_file = ACCOUNTS_FILE
-        if os.path.exists(accounts_file):
-            try:
-                with open(accounts_file, "r", encoding="utf-8") as f:
-                    existing = json.load(f)
-                new_existing = []
-                for acc in existing:
-                    acc_uid = str(acc.get("uid", "")).strip()
-                    acc_tok = str(acc.get("token", "")).strip()
-                    is_match = False
-                    if acc_uid and acc_uid in candidate_ids:
-                        is_match = True
-                    if acc_tok and (acc_tok in candidate_ids or acc_tok in target_tokens):
-                        is_match = True
-                    for tok in target_tokens:
-                        if acc_tok and (acc_tok.startswith(tok[:16]) or tok.startswith(acc_tok[:16])):
-                            is_match = True
-                    if not is_match:
-                        new_existing.append(acc)
+        # Remove the saved account records (by uid and by token)
+        removed_accounts = 0
+        try:
+            for cid in list(candidate_ids):
+                removed_accounts += storage.remove_account(uid=cid)
+            for tok in target_tokens:
+                removed_accounts += storage.remove_account(token=tok)
+                removed_accounts += storage.remove_account(uid=tok[:16])
+            for acc in storage.list_accounts():
+                acc_tok = str(acc.get("token", "")).strip()
+                if acc_tok and any(
+                        acc_tok.startswith(tok[:16]) or tok.startswith(acc_tok[:16])
+                        for tok in target_tokens):
+                    removed_accounts += storage.remove_account(token=acc_tok)
+        except Exception as e:
+            bot_state.log(f"Account cleanup failed for {req_uid or req_auth_uid}: {e}",
+                          "warning", req_uid or req_auth_uid)
 
-                with open(accounts_file, "w", encoding="utf-8") as f:
-                    json.dump(new_existing, f, indent=2)
-            except Exception:
-                pass
-
-        # Remove matching devices from devices.json
-        devices_file = DEVICES_FILE
-        if os.path.exists(devices_file):
-            try:
-                with open(devices_file, "r", encoding="utf-8") as f:
-                    devices_data = json.load(f)
-                dirty_devices = False
-                for dev_k in list(devices_data.keys()):
-                    dev_k_str = str(dev_k)
-                    if dev_k_str in candidate_ids:
-                        del devices_data[dev_k]
-                        dirty_devices = True
-                    else:
-                        for tok in target_tokens:
-                            if dev_k_str == tok[:16] or tok.startswith(dev_k_str):
-                                del devices_data[dev_k]
-                                dirty_devices = True
-                                break
-                if dirty_devices:
-                    with open(devices_file, "w", encoding="utf-8") as f:
-                        json.dump(devices_data, f, indent=4)
-            except Exception:
-                pass
+        # Remove matching device fingerprints
+        try:
+            for dev_k in list(storage.devices_all().keys()):
+                dev_k_str = str(dev_k)
+                if dev_k_str in candidate_ids or any(
+                        dev_k_str == tok[:16] or tok.startswith(dev_k_str)
+                        for tok in target_tokens):
+                    storage.device_delete(dev_k_str)
+        except Exception as e:
+            bot_state.log(f"Device cleanup failed for {req_uid or req_auth_uid}: {e}",
+                          "warning", req_uid or req_auth_uid)
 
         # Remove from in-memory bot_state.accounts & credentials
         for cid in candidate_ids:
@@ -922,14 +984,16 @@ async def handle_delete_account(request: web.Request) -> web.Response:
         # Trigger on_account_deleted callback in Main.py if registered
         if "on_account_deleted" in bot_state.refresh_callbacks:
             try:
-                asyncio.create_task(bot_state.refresh_callbacks["on_account_deleted"](list(candidate_ids)))
-            except Exception:
-                pass
+                bot_state.spawn(bot_state.refresh_callbacks["on_account_deleted"](list(candidate_ids)))
+            except Exception as e:
+                bot_state.log(f"Delete callback failed for {req_uid or req_auth_uid}: {e}",
+                              "warning", req_uid or req_auth_uid)
 
         target_repr = req_uid or req_auth_uid
         bot_state.log(f"Account {target_repr} completely deleted from system and stopped.", "warning", target_repr)
         bot_state.recalc_totals()
-        return web.json_response({"status": "ok", "deleted": list(candidate_ids)})
+        return web.json_response(redact_secrets({"status": "ok", "deleted": list(candidate_ids),
+                                                 "accounts_removed": removed_accounts}))
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
 
@@ -939,7 +1003,7 @@ async def handle_refresh_account(request: web.Request) -> web.Response:
         data = await request.json()
         uid = str(data.get("uid", "")).strip()
         if "on_refresh_account" in bot_state.refresh_callbacks:
-            asyncio.create_task(bot_state.refresh_callbacks["on_refresh_account"](uid))
+            bot_state.spawn(bot_state.refresh_callbacks["on_refresh_account"](uid))
         return web.json_response({"status": "ok"})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
@@ -965,6 +1029,12 @@ async def handle_restart_account(request: web.Request) -> web.Response:
                 or uid in bot_state.game_to_auth_id
             )
             if not known:
+                try:
+                    known = any(str(acc.get("uid", "")) == uid
+                                for acc in storage.list_accounts())
+                except Exception as e:
+                    bot_state.log(f"Restart lookup failed for {uid}: {e}", "warning", uid)
+            if not known:
                 return web.json_response(
                     {"status": "error", "error": f"Unknown account: {uid}"}, status=404)
 
@@ -975,7 +1045,7 @@ async def handle_restart_account(request: web.Request) -> web.Response:
                 bot_state.log(f"Restart failed for {uid or 'all'}: {e}",
                               "warning", uid or None)
 
-        asyncio.create_task(run_restart())
+        bot_state.spawn(run_restart())
         return web.json_response({"status": "ok", "restarted": uid or "all"})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
@@ -1010,19 +1080,19 @@ async def handle_api_logs(request: web.Request) -> web.Response:
     for entry in bot_state.logs[-80:]:
         if isinstance(entry, dict):
             t = entry.get("time", "")
-            msg = entry.get("message", "")
+            msg = redact_text(entry.get("message", ""))
             level = entry.get("level", "info")
             color = "#34d399" if level == "success" else ("#f87171" if level == "warning" or level == "error" else "#38bdf8")
             formatted_logs.append(f'<span style="color:{color}">[{t}] {msg}</span>')
         else:
-            formatted_logs.append(str(entry))
+            formatted_logs.append(redact_text(entry))
     return web.json_response({"logs": formatted_logs}, status=200)
 
 
 # ==================== START WEB DASHBOARD ====================
 
 async def start_web_dashboard(host: str = "127.0.0.1", port: int = 5000):
-    app = web.Application()
+    app = web.Application(middlewares=[api_key_middleware])
     app.router.add_get("/", handle_index)
     app.router.add_post("/api/clanjoin", handle_api_clan_join)
     app.router.add_get("/api/guildinfo", handle_api_guild_info)

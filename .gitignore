@@ -7,3 +7,6 @@ token_cache.json
 devices.json
 accounts.json
 guild_exp_cache.json
+sahilops.db
+sahilops.db-wal
+sahilops.db-shm

@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="sahilops-api-key" content="__SAHILOPS_API_KEY__">
     <title>SahilOps Dashboard</title>
     <style>
         :root {
@@ -565,8 +566,14 @@
     <script>
         const DEFAULT_CLAN_ID = "3055517625";
         const DEFAULT_REGION = "IND";
+        const API_KEY = document.querySelector('meta[name="sahilops-api-key"]').content;
         let autoRefreshTimer = null;
         let isAllPaused = false;
+
+        // Every write route requires the control-panel key in X-API-Key.
+        function apiHeaders() {
+            return {'Content-Type': 'application/json', 'X-API-Key': API_KEY};
+        }
 
         function formatUptime(totalSeconds) {
             const hours = Math.floor(totalSeconds / 3600);
@@ -577,9 +584,9 @@
 
         async function fetchGuildInfo() {
             try {
-                const guildRes = await fetch(`/api/guildinfo?guild_id=${DEFAULT_CLAN_ID}&region=${DEFAULT_REGION}&key=SAHILOPS`, {
+                const guildRes = await fetch(`/api/guildinfo?guild_id=${DEFAULT_CLAN_ID}&region=${DEFAULT_REGION}`, {
                     method: 'GET',
-                    headers: {'Content-Type': 'application/json'}
+                    headers: apiHeaders()
                 });
                 
                 if (!guildRes.ok) return;
@@ -611,7 +618,7 @@
             try {
                 const res = await fetch('/api/stats', {
                     method: 'GET',
-                    headers: {'Content-Type': 'application/json'}
+                    headers: apiHeaders()
                 });
                 if (!res.ok) return;
                 const stats = await res.json();
@@ -631,7 +638,7 @@
             try {
                 const logsRes = await fetch('/api/logs', {
                     method: 'GET',
-                    headers: {'Content-Type': 'application/json'}
+                    headers: apiHeaders()
                 });
                 if (!logsRes.ok) return;
 
@@ -655,7 +662,7 @@
             try {
                 const res = await fetch('/api/logs/clear', {
                     method: 'POST',
-                    headers: {'Content-Type': 'application/json'}
+                    headers: apiHeaders()
                 });
                 if (res.ok) {
                     document.getElementById('bot-logs').innerHTML = '<span style="color: #38bdf8;">[System]</span> Logs cleared.';
@@ -686,7 +693,7 @@
             try {
                 const res = await fetch('/api/account/add', {
                     method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
+                    headers: apiHeaders(),
                     body: JSON.stringify({ uid, password })
                 });
                 const data = await res.json();
@@ -709,7 +716,7 @@
             try {
                 const res = await fetch(endpoint, {
                     method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
+                    headers: apiHeaders(),
                     body: JSON.stringify({})
                 });
                 const data = await res.json();

@@ -2,17 +2,20 @@
 
 Ordered by impact ÷ effort. "Effort" is rough (S ≤ ½ day, M ≤ 2 days, L > 2 days).
 
-> **SahilOps status:** P0 #3–#8 are implemented. #1 is partial (`.gitignore`
+> **SahilOps status:** P0 #2–#8 are implemented. #1 is partial (`.gitignore`
 > added; rotating the leaked tokens is still an operator step) and #2 is
-> partial (the dashboard now binds `127.0.0.1`; auth middleware and API secret
-> filtering remain recommendations).
+> complete (localhost binding, API-key middleware on every write route, and
+> secret filtering on `/api/stats` and `/api/logs`). In P2, #18 (SQLite state)
+> and #19 (background-task draining) are complete — see
+> [P2 storage & testing milestone](#p2-storage--testing-milestone) and
+> [P0 #2 milestone](#p0-2-milestone-dashboard-auth--secret-filtering).
 
 ## P0 — do first (security & correctness)
 
 | # | Change | Why | Effort |
 |---|---|---|---|
 | 1 | Revoke every token in `token_cache.json`; remove caches from distributions; add `.gitignore` | Live sessions and device IDs are already leaked | S |
-| 2 | Bind dashboard to `127.0.0.1`, add token auth middleware, remove account secrets from API responses | Anyone on the LAN can currently control the bot | S |
+| 2 | ~~Bind dashboard to `127.0.0.1`, add token auth middleware, remove account secrets from API responses~~ — **done** | Anyone on the LAN could control the bot | S |
 | 3 | Delete `sendAutomaticJoinRequest()` from page load; make clan join an explicit confirmed button | Opening the dashboard silently joins a third-party clan with all accounts | S |
 | 4 | Replace `CguFF_pb2` with `thunderFF_pb2.StartMatch` (or import `StartMatch_pb2`) | Region/version currently ignored in every search | S |
 | 5 | Wire `register_writer`/`unregister_writer` and implement a real pause/resume | Stop/Restart buttons lie; paused accounts keep their sockets | M |
@@ -43,15 +46,92 @@ Ordered by impact ÷ effort. "Effort" is rough (S ≤ ½ day, M ≤ 2 days, L > 
 | 20 | Package as a proper project (`pyproject.toml`, `README`, `--dry-run`, `--log-level`) | Reproducible installs and safer operation | M |
 | 21 | Drop the joiner's third-party backends; self-host with POST + TLS verification | Credential exfiltration risk | L |
 
+## P2 storage & testing milestone
+
+Status: complete. Closed items **#18** and **#19**.
+
+### #18 — SQLite state instead of JSON
+
+`core/storage.py` is now the single write path for accounts, device
+fingerprints, and cached sessions (`sahilops.db`, WAL mode, one connection per
+process, serialized writes).
+
+- `core/app.py`, `dashboard/dashboard_server.py`, and `utils/SaMIGEN.py` no
+  longer read or write `accounts.json`, `devices.json`, or `token_cache.json`.
+- The three legacy JSON files are imported once on first start (guarded by a
+  `kv` marker) and then left untouched.
+- Adding, deleting, or restarting an account from the dashboard updates the
+  same rows the engine loads at startup, so the generator and the dashboard can
+  run concurrently without lost updates.
+- Override the location with `SAHILOPS_DB`; the database file is git-ignored and
+  created with mode `0600`.
+
+### #19 — Background tasks and shutdown
+
+- `BotState.spawn()` tracks every fire-and-forget callback task; failures are
+  logged instead of being swallowed.
+- `BotState.drain()` awaits pending tasks with a timeout, then cancels what is
+  left, so shutdown cannot hang on a stuck callback.
+- `main()` now always runs its cleanup path: workers are cancelled and awaited,
+  background tasks are drained, the aiohttp runner is cleaned up (port
+  released), and the database is closed.
+- Silent `except Exception: pass` blocks around handshake sends (cmd-101 reply,
+  HELLO resend, startup packet, keepalive, friend confirm) now log a warning.
+- Region override is a testable pure helper, `apply_region_override()`, used by
+  `start_game_battle_royale()`; on a parse failure it returns the original
+  packet rather than a partially mutated one.
+
+### Verification
+
+```bash
+python -m compileall -q core dashboard utils   # clean
+.venv/bin/python tests/smoke_test.py           # 52/52 checks
+python -m core.app                             # binds 127.0.0.1:20333
+```
+
+The smoke test covers the storage layer (including 160 concurrent upserts and
+JSON migration), dashboard index/stats/logs, account add → pause → restart →
+delete cycles, callback draining, squad sizing (`_squad_target_size` clamps to
+`[1, TEAM_SIZE]`), and region override for `ID`/`SG`/`IND`. The live run was
+verified to bind only `127.0.0.1:20333`, serve `/api/stats` and `/api/logs`, and
+release the port on SIGINT with `Closed.` in the log.
+
+## P0 #2 milestone: dashboard auth & secret filtering
+
+Status: complete.
+
+- An aiohttp middleware (`api_key_middleware`) rejects every `POST`/`PUT`/
+  `PATCH`/`DELETE` that does not carry `X-API-Key` matching `SAHILOPS_API_KEY`
+  (default `SAHILOPS`), compared with `hmac.compare_digest`. All account add /
+  delete / refresh / restart / pause / pause-all routes, log clearing, and clan
+  join are covered, so a forgotten handler cannot be written around.
+- `/api/guildinfo` validates the same header (legacy `?key=` still accepted);
+  the key is no longer hard-coded in URLs or the page. `handle_index` injects
+  the configured key into the served HTML.
+- `redact_secrets()` removes secret fields recursively (`token`, `access_token`,
+  `refresh_token`, `password`, `secret`, `api_key`, AES key/IV, session keys,
+  credentials, cookies, `Authorization`) from `/api/stats`, `/api/logs`, and the
+  delete response, and scrubs JWT / `Bearer …` / `key=value` shapes from text.
+- `/api/stats` builds copies of account dicts before annotating them, so a read
+  path no longer mutates live state.
+
+Verification: `tests/smoke_test.py` now exercises all eight write routes without
+and with a key, the redaction helpers, and the live responses (52/52 checks).
+
 ## Known limitations
 
 - **Battle Royale only.** `mode`/`LONE_WOLF` UI is vestigial.
 - **One process, many accounts.** No horizontal scaling; squad state is in memory.
+- **The squad bot still has no protocol test.** The smoke test covers storage,
+  the dashboard, squad sizing, and region override only; live match flow needs
+  real accounts and game servers.
 - **Protocol constants are reverse-engineered guesses** (TEA layout, 660-char JWT
   split, movement packet tail bytes). A game patch can break them at any time.
 - **No account-level rate limiting.** Many accounts share one outbound IP and
   fixed device/version headers.
-- **No test or CI setup.** `__pycache__` from 3.13 is shipped but unused.
+- **No CI.** `tests/smoke_test.py` runs locally but nothing runs it on push.
+- **The dashboard key is a local access gate, not multi-user auth.** The page
+  receives the key from the server, so anyone who can load it can send writes.
 - **Ethics/ToS:** the tool automates live game accounts; using it can get accounts
   banned and violates the game's terms.
 
