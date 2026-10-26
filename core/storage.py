@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     uid        TEXT UNIQUE COLLATE NOCASE,
     token      TEXT UNIQUE,
     data       TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'active',
+    error_count INTEGER NOT NULL DEFAULT 0,
+    status_reason TEXT,
+    proxy      TEXT,
     updated_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS devices (
@@ -140,6 +144,24 @@ def _migrate_json(conn: sqlite3.Connection) -> None:
     _last_migration = counts
 
 
+# Health/proxy columns added after the first release; older databases are
+# altered in place on open so no manual migration step is needed.
+_ACCOUNT_COLUMNS = {
+    "status": "TEXT NOT NULL DEFAULT 'active'",
+    "error_count": "INTEGER NOT NULL DEFAULT 0",
+    "status_reason": "TEXT",
+    "proxy": "TEXT",
+}
+ACCOUNT_STATUSES = ("active", "suspended", "quarantined")
+
+
+def _ensure_account_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(accounts)")}
+    for name, declaration in _ACCOUNT_COLUMNS.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE accounts ADD COLUMN {name} {declaration}")
+
+
 def _connection() -> sqlite3.Connection:
     global _conn
     if _conn is None:
@@ -151,6 +173,7 @@ def _connection() -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(_SCHEMA)
+        _ensure_account_columns(conn)
         conn.commit()
         try:
             os.chmod(DB_PATH, 0o600)
@@ -203,10 +226,59 @@ def last_migration() -> Dict[str, int]:
 
 # ─────────────────────────── accounts ───────────────────────────
 
-def list_accounts() -> List[dict]:
+def _account_row(conn: sqlite3.Connection, uid: Optional[str] = None,
+                 token: Optional[str] = None) -> Optional[sqlite3.Row]:
+    columns = "id, uid, token, status, error_count, status_reason, proxy"
+    if uid:
+        row = conn.execute(
+            f"SELECT {columns} FROM accounts WHERE uid = ?", (str(uid),)
+        ).fetchone()
+        if row or not token:
+            return row
+    if token:
+        return conn.execute(
+            f"SELECT {columns} FROM accounts WHERE token = ?", (str(token),)
+        ).fetchone()
+    return None
+
+
+def _record(row: sqlite3.Row) -> dict:
+    rec = _loads(row["data"])
+    if not isinstance(rec, dict):
+        rec = {}
+    rec["uid"] = row["uid"] or rec.get("uid", "")
+    rec["token"] = row["token"] or rec.get("token", "")
+    rec["status"] = row["status"] or "active"
+    rec["error_count"] = int(row["error_count"] or 0)
+    if row["status_reason"]:
+        rec["status_reason"] = row["status_reason"]
+    rec["proxy"] = row["proxy"] or rec.get("proxy") or ""
+    return rec
+
+
+def list_accounts(status: Optional[str] = None) -> List[dict]:
+    query = "SELECT data, uid, token, status, error_count, status_reason, proxy FROM accounts"
+    params: tuple = ()
+    if status:
+        query += " WHERE status = ?"
+        params = (str(status),)
+    query += " ORDER BY id"
     with _lock:
-        rows = _connection().execute("SELECT data FROM accounts ORDER BY id").fetchall()
-    return [_loads(r["data"]) for r in rows]
+        rows = _connection().execute(query, params).fetchall()
+    return [_record(r) for r in rows]
+
+
+def get_account(uid: Optional[str] = None, token: Optional[str] = None) -> Optional[dict]:
+    with _lock:
+        conn = _connection()
+        row = _account_row(conn, uid, token)
+        if row is None:
+            return None
+        full = conn.execute(
+            "SELECT data, uid, token, status, error_count, status_reason, proxy "
+            "FROM accounts WHERE id = ?", (row["id"],)
+        ).fetchone()
+    return _record(full) if full else None
 
 
 def upsert_account(rec: dict) -> dict:
@@ -217,16 +289,18 @@ def upsert_account(rec: dict) -> dict:
     if not uid and not token:
         raise ValueError("account record needs a uid or token")
 
+    status = str(rec.get("status") or "").strip().lower()
+    if status and status not in ACCOUNT_STATUSES:
+        raise ValueError(f"unknown account status '{status}'")
+    proxy = str(rec.get("proxy") or "").strip()
+    reason = rec.get("status_reason")
+
     payload = _dumps(rec)
     now = time.time()
     with _lock:
         conn = _connection()
         with conn:
-            row = None
-            if uid:
-                row = conn.execute("SELECT id FROM accounts WHERE uid = ?", (uid,)).fetchone()
-            if row is None and token:
-                row = conn.execute("SELECT id FROM accounts WHERE token = ?", (token,)).fetchone()
+            row = _account_row(conn, uid, token)
 
             # A re-add can move a uid or token between records; drop the loser.
             for column, value in (("uid", uid), ("token", token)):
@@ -240,15 +314,86 @@ def upsert_account(rec: dict) -> dict:
 
             if row is None:
                 conn.execute(
-                    "INSERT INTO accounts (uid, token, data, updated_at) VALUES (?,?,?,?)",
-                    (uid, token, payload, now),
+                    "INSERT INTO accounts (uid, token, data, status, error_count, "
+                    "status_reason, proxy, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (uid, token, payload, status or "active", 0,
+                     reason if status else None, proxy or None, now),
                 )
             else:
+                new_status = status or (row["status"] or "active")
+                new_reason = reason if "status_reason" in rec else row["status_reason"]
+                if new_status == "active":
+                    new_reason = None
+                new_proxy = proxy if "proxy" in rec else (row["proxy"] or "")
                 conn.execute(
-                    "UPDATE accounts SET uid=?, token=?, data=?, updated_at=? WHERE id=?",
-                    (uid, token, payload, now, row["id"]),
+                    "UPDATE accounts SET uid=?, token=?, data=?, status=?, status_reason=?, "
+                    "proxy=?, updated_at=? WHERE id=?",
+                    (uid, token, payload, new_status, new_reason,
+                     new_proxy or None, now, row["id"]),
                 )
     return rec
+
+
+def set_account_status(uid: Optional[str] = None, token: Optional[str] = None,
+                       status: str = "active", reason: Optional[str] = None) -> int:
+    """Set health status. Moving back to ``active`` clears the error counter."""
+    status = str(status or "").strip().lower()
+    if status not in ACCOUNT_STATUSES:
+        raise ValueError(f"unknown account status '{status}'")
+    with _lock:
+        conn = _connection()
+        row = _account_row(conn, uid, token)
+        if row is None:
+            return 0
+        with conn:
+            conn.execute(
+                "UPDATE accounts SET status=?, status_reason=?, "
+                "error_count=CASE WHEN ?='active' THEN 0 ELSE error_count END, "
+                "updated_at=? WHERE id=?",
+                (status, None if status == "active" else reason, status, time.time(), row["id"]),
+            )
+    return 1
+
+
+def bump_account_error(uid: Optional[str] = None, token: Optional[str] = None,
+                       reason: Optional[str] = None, threshold: int = 5) -> dict:
+    """Count one failure, quarantining the account once ``threshold`` is reached."""
+    with _lock:
+        conn = _connection()
+        row = _account_row(conn, uid, token)
+        if row is None:
+            return {"found": False, "error_count": 0, "status": "", "quarantined": False}
+        count = int(row["error_count"] or 0) + 1
+        status = row["status"] or "active"
+        quarantined = False
+        if status == "active" and count >= max(1, int(threshold)):
+            status = "quarantined"
+            reason = reason or f"{count} consecutive errors"
+            quarantined = True
+        new_reason = None if status == "active" else (reason or row["status_reason"])
+        with conn:
+            conn.execute(
+                "UPDATE accounts SET error_count=?, status=?, status_reason=?, updated_at=? "
+                "WHERE id=?",
+                (count, status, new_reason, time.time(), row["id"]),
+            )
+    return {"found": True, "error_count": count, "status": status,
+            "quarantined": quarantined}
+
+
+def reset_account_errors(uid: Optional[str] = None, token: Optional[str] = None) -> int:
+    """Clear the failure counter after a healthy connection or login."""
+    with _lock:
+        conn = _connection()
+        row = _account_row(conn, uid, token)
+        if row is None:
+            return 0
+        with conn:
+            conn.execute(
+                "UPDATE accounts SET error_count=0, updated_at=? WHERE id=?",
+                (time.time(), row["id"]),
+            )
+    return 1
 
 
 def remove_account(uid: Optional[str] = None, token: Optional[str] = None) -> int:

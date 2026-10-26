@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""SahilOps smoke test — storage, dashboard endpoints, squad sizing, region override.
+"""SahilOps smoke test — storage, health, proxies, alerts, dashboard, protocol helpers.
 
 Runs against a throwaway SQLite database and a real dashboard bound to
 127.0.0.1:20333, so it exercises the same code paths the bot uses.
@@ -14,11 +14,15 @@ import argparse
 import asyncio
 import json
 import os
+import socket
+import sqlite3
+import struct
 import sys
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from aiohttp import web
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
@@ -29,9 +33,10 @@ os.environ["SAHILOPS_DB"] = os.path.join(WORK_DIR, "smoke.db")
 
 import httpx
 
-from core import storage
+from core import health, notifications, storage
+from core import proxy as proxy_support
 from core import thunderFF_pb2
-from core.app import BR_HEX, _squad_target_size, apply_region_override
+from core.app import BR_HEX, _squad_target_size, _start_worker, apply_region_override
 from dashboard.dashboard_server import (
     API_KEY,
     bot_state,
@@ -111,6 +116,240 @@ def test_storage():
         storage.remove_account(uid=str(acc.get("uid", "")) or None,
                                token=str(acc.get("token", "")) or None)
     check("storage: cleanup leaves an empty table", storage.list_accounts() == [])
+
+
+def test_storage_health():
+    db = os.path.join(WORK_DIR, "old-schema.db")
+    empty = os.path.join(WORK_DIR, "no-legacy")
+    os.makedirs(empty, exist_ok=True)
+
+    # A database created before the health/proxy columns existed.
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "uid TEXT UNIQUE COLLATE NOCASE, token TEXT UNIQUE, data TEXT NOT NULL, "
+        "updated_at REAL NOT NULL);"
+        "INSERT INTO accounts (uid, token, data, updated_at) "
+        "VALUES ('old-1', 'tok-old', '{}', 0);"
+    )
+    conn.commit()
+    conn.close()
+
+    storage.close()
+    storage.init(path=db, migrate_from=empty)
+    rec = storage.get_account(uid="old-1")
+    check("storage: old schema gains health/proxy columns",
+          bool(rec) and rec["status"] == "active" and rec["error_count"] == 0
+          and "proxy" in rec, str(rec))
+
+    storage.set_account_status(uid="old-1", status="suspended", reason="account banned")
+    rec = storage.get_account(uid="old-1")
+    check("storage: suspension persisted with reason",
+          rec["status"] == "suspended" and rec["status_reason"] == "account banned", str(rec))
+
+    storage.set_account_status(uid="old-1", status="active")
+    rec = storage.get_account(uid="old-1")
+    check("storage: reactivation clears the reason",
+          rec["status"] == "active" and not rec.get("status_reason"), str(rec))
+
+    counts = [storage.bump_account_error(uid="old-1", reason="boom", threshold=3)
+              for _ in range(3)]
+    check("storage: errors are counted before the threshold",
+          counts[0]["error_count"] == 1 and counts[1]["error_count"] == 2
+          and not counts[1]["quarantined"], str(counts))
+    check("storage: threshold quarantines the account",
+          counts[2]["quarantined"] and counts[2]["status"] == "quarantined", str(counts[2]))
+
+    storage.reset_account_errors(uid="old-1")
+    check("storage: reset clears the error counter",
+          storage.get_account(uid="old-1")["error_count"] == 0)
+
+    storage.upsert_account({"uid": "proxy-1", "password": "pw",
+                            "proxy": "socks5://user:pass@10.0.0.1:1080"})
+    rec = storage.get_account(uid="proxy-1")
+    check("storage: per-account proxy persisted",
+          rec and rec.get("proxy") == "socks5://user:pass@10.0.0.1:1080", str(rec))
+
+    storage.remove_account(uid="old-1")
+    storage.remove_account(uid="proxy-1")
+    check("storage: health fixtures cleaned up", storage.list_accounts() == [])
+
+
+def test_health_detection():
+    positives = {
+        "{\"error\":\"account is banned\"}": "account banned",
+        "Account suspended for cheating": "account suspended",
+        "account has been restricted": "account restricted",
+        "{\"ban\": 1}": "flag",
+        "{\"error_code\": 1004}": "code 1004",
+        "permanently banned": "permanently banned",
+    }
+    for text, expected in positives.items():
+        reason = health.detect_suspension(text)
+        check(f"health: detects '{text[:32]}'",
+              bool(reason) and expected in str(reason), str(reason))
+
+    for text in ("banner advertisement loaded", "match completed", "connection reset", ""):
+        check(f"health: no false positive for '{text or 'empty'}'",
+              health.detect_suspension(text) is None, str(health.detect_suspension(text)))
+
+    check("health: binary payload does not crash detection",
+          health.detect_suspension(b"\xff\xfe account is banned") is not None)
+    check("health: quarantine statuses recognised",
+          health.is_quarantine_status("suspended")
+          and health.is_quarantine_status("QUARANTINED")
+          and not health.is_quarantine_status("active"))
+
+    rec = {"uid": "blocked-worker", "password": "pw", "status": "quarantined"}
+    task = _start_worker(rec)
+    check("health: quarantined account starts no worker",
+          task is None and "blocked-worker" not in bot_state.account_workers)
+
+
+def test_proxy_helpers():
+    info = proxy_support.parse_proxy("socks5://user:p%40ss@10.0.0.5:1080")
+    check("proxy: url parsed with credentials",
+          info and info["scheme"] == "socks5" and info["host"] == "10.0.0.5"
+          and info["port"] == 1080 and info["password"] == "p@ss", str(info))
+    check("proxy: credentials masked in labels",
+          proxy_support.describe_proxy("http://user:secret@10.0.0.5:8080")
+          == "http://***@10.0.0.5:8080")
+    check("proxy: empty string means direct",
+          proxy_support.normalize_proxy("") is None
+          and proxy_support.normalize_proxy(None) is None)
+    for bad in ("ftp://10.0.0.5:21", "10.0.0.5:1080", "socks5://10.0.0.5"):
+        try:
+            proxy_support.normalize_proxy(bad)
+            raised = False
+        except ValueError:
+            raised = True
+        check(f"proxy: rejects '{bad}'", raised)
+
+
+async def _start_fake_proxy(kind):
+    """Minimal CONNECT / SOCKS5 server that echoes tunnelled bytes."""
+    seen = {}
+
+    async def handle(reader, writer):
+        try:
+            if kind == "http":
+                head = await reader.readuntil(b"\r\n\r\n")
+                seen["request"] = head.decode("latin-1", "replace").split("\r\n", 1)[0]
+                writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                await writer.drain()
+            else:
+                greeting = await reader.readexactly(2)
+                await reader.readexactly(greeting[1])
+                writer.write(b"\x05\x00")
+                await writer.drain()
+                request = await reader.readexactly(4)
+                atyp = request[3]
+                if atyp == 1:
+                    host = socket.inet_ntoa(await reader.readexactly(4))
+                elif atyp == 3:
+                    length = (await reader.readexactly(1))[0]
+                    host = (await reader.readexactly(length)).decode()
+                else:
+                    host = "?"
+                port = struct.unpack(">H", await reader.readexactly(2))[0]
+                seen["request"] = f"{host}:{port}"
+                writer.write(b"\x05\x00\x00\x01" + b"\x00" * 4 + b"\x00\x00")
+                await writer.drain()
+            while True:
+                data = await reader.read(1024)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    return server, seen
+
+
+async def test_proxy_tunnels():
+    for kind in ("http", "socks5h"):
+        server, seen = await _start_fake_proxy(kind)
+        port = server.sockets[0].getsockname()[1]
+        writer = None
+        try:
+            reader, writer = await proxy_support.open_connection(
+                "gateway.example.com", 20333, f"{kind}://127.0.0.1:{port}", timeout=5.0)
+            writer.write(b"ping")
+            await writer.drain()
+            echoed = await asyncio.wait_for(reader.readexactly(4), timeout=5.0)
+            check(f"proxy: {kind} tunnel carries gateway traffic", echoed == b"ping", str(echoed))
+            check(f"proxy: {kind} CONNECT target preserved",
+                  "gateway.example.com:20333" in seen.get("request", ""),
+                  seen.get("request", ""))
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+            server.close()
+            await server.wait_closed()
+
+
+async def test_notifications():
+    received = []
+
+    async def hook(request):
+        received.append(await request.json())
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_post("/hook", hook)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    url = f"http://127.0.0.1:{port}/hook"
+
+    notifier = notifications.Notifier(url=url, min_interval=0.0)
+    check("alerts: notifier enabled for an http webhook", notifier.enabled)
+    check("alerts: disabled without a URL", not notifications.Notifier(url="").enabled)
+    check("alerts: telegram needs a chat id",
+          not notifications.Notifier(url="https://api.telegram.org/botX/sendMessage").enabled)
+    check("alerts: webhook kind classified",
+          notifications.classify_webhook("https://discord.com/api/webhooks/1/x") == "discord"
+          and notifications.classify_webhook(
+              "https://api.telegram.org/bot1/sendMessage") == "telegram")
+
+    telegram = notifications.build_payload(
+        "https://api.telegram.org/botX/sendMessage", "hello", "42", "level_up")
+    check("alerts: telegram payload shape",
+          telegram.get("chat_id") == "42" and telegram.get("text") == "hello", str(telegram))
+    discord = notifications.build_payload(
+        "https://discord.com/api/webhooks/1/x", "hello", None, "level_up")
+    check("alerts: discord payload shape", discord.get("content") == "hello", str(discord))
+
+    try:
+        sent = await notifier.notify("level_up", "Level 5 → 6", uid="42",
+                                     token="secret-token-value")
+        check("alerts: alert queued", sent is True)
+        await notifier.flush(timeout=5.0)
+        check("alerts: webhook received the alert",
+              len(received) == 1 and "Level 5" in received[0].get("text", ""),
+              str(received))
+        check("alerts: event name and account included",
+              received and received[0].get("event") == "level_up"
+              and "account 42" in received[0].get("text", ""), str(received[:1]))
+        check("alerts: token-shaped text scrubbed before sending",
+              "secret-token-value" not in json.dumps(received), str(received[:1]))
+        check("alerts: delivery counted", notifier.sent_count == 1, str(notifier.sent_count))
+    finally:
+        await notifier.close(timeout=5.0)
+        await runner.cleanup()
 
 
 def test_squad_sizing():
@@ -224,6 +463,49 @@ async def test_dashboard(port):
                   logs_res.text[:200])
             bot_state.accounts.pop("secret-uid", None)
 
+            # Health and proxy annotations come from SQLite, not engine state.
+            storage.upsert_account({"uid": "health-acct", "password": "pw",
+                                    "proxy": "socks5://user:topsecret@10.0.0.9:1080"})
+            storage.set_account_status(uid="health-acct", status="quarantined",
+                                       reason="3 consecutive errors")
+            bot_state.register_account("health-acct", "FlaggedPlayer", "IND", 7, 5000)
+            res = await client.get("/api/stats")
+            body = res.json()
+            flagged = next((a for a in body["accounts"] if a.get("uid") == "health-acct"), {})
+            check("dashboard: quarantined account reported by /api/stats",
+                  flagged.get("health", {}).get("status") == "quarantined",
+                  str(flagged.get("health")))
+            check("dashboard: health summary counts flagged accounts",
+                  body.get("health", {}).get("quarantined") == 1, str(body.get("health")))
+            check("dashboard: proxy credentials masked in stats",
+                  "topsecret" not in res.text
+                  and "socks5://***@10.0.0.9:1080" in res.text, res.text[:200])
+            check("dashboard: quarantine reason included for operators",
+                  "3 consecutive errors" in res.text, res.text[:200])
+            bot_state.accounts.pop("health-acct", None)
+
+            # A quarantined record skipped at startup has no engine account.
+            storage.upsert_account({"uid": "idle-acct", "password": "pw"})
+            storage.set_account_status(uid="idle-acct", status="suspended", reason="banned")
+            res = await client.get("/api/stats")
+            body = res.json()
+            idle = next((a for a in body["accounts"] if a.get("uid") == "idle-acct"), {})
+            check("dashboard: persisted account without a worker still listed",
+                  idle.get("health", {}).get("status") == "suspended", str(idle))
+            storage.remove_account(uid="idle-acct")
+            storage.remove_account(uid="health-acct")
+
+            res = await client.post("/api/account/add", json={
+                "uid": "proxy-uid", "password": "pw", "proxy": "http://127.0.0.1:8080"})
+            check("dashboard: add account accepts a proxy", res.status_code == 200, res.text)
+            saved_rec = storage.get_account(uid="proxy-uid") or {}
+            check("dashboard: proxy saved with the account",
+                  saved_rec.get("proxy") == "http://127.0.0.1:8080", str(saved_rec))
+            res = await client.post("/api/account/add", json={
+                "uid": "bad-proxy", "password": "pw", "proxy": "ftp://127.0.0.1:21"})
+            check("dashboard: invalid proxy rejected", res.status_code == 400, str(res.status_code))
+            await client.post("/api/account/delete", json={"uid": "proxy-uid"})
+
             bot_state.log("smoke-test log line", "info")
             res = await client.get("/api/logs")
             check("dashboard: /api/logs streams live log entries",
@@ -236,7 +518,9 @@ async def test_dashboard(port):
             saved = {a.get("uid") for a in storage.list_accounts()}
             check("dashboard: added account persisted to SQLite", "smoke-uid" in saved, str(saved))
             await asyncio.wait_for(_wait_for(lambda: calls["added"]), timeout=3.0)
-            check("dashboard: add callback ran", calls["added"] and calls["added"][0].get("uid") == "smoke-uid")
+            check("dashboard: add callback ran",
+                  any(entry.get("uid") == "smoke-uid" for entry in calls["added"]),
+                  str(calls["added"]))
 
             res = await client.post("/api/account/pause", json={"uid": "smoke-uid"})
             check("dashboard: pause toggles state",
@@ -304,9 +588,20 @@ def main():
     print("=" * 64)
 
     test_storage()
+    test_storage_health()
     test_squad_sizing()
     test_redaction_helpers()
     test_region_override()
+    test_health_detection()
+    test_proxy_helpers()
+    try:
+        asyncio.run(test_proxy_tunnels())
+    except Exception as e:
+        check("proxy: tunnels run without error", False, f"{type(e).__name__}: {e}")
+    try:
+        asyncio.run(test_notifications())
+    except Exception as e:
+        check("alerts: notifier run without error", False, f"{type(e).__name__}: {e}")
     try:
         asyncio.run(test_dashboard(args.port))
     except Exception as e:

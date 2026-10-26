@@ -458,6 +458,78 @@
             background: var(--accent-cyan);
             color: #030712;
         }
+
+        /* Account health */
+        .health-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .health-empty {
+            color: var(--text-sub);
+            font-size: 12px;
+            text-align: center;
+            padding: 10px 0;
+        }
+
+        .health-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            background: rgba(3, 7, 18, 0.6);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 12px;
+            padding: 10px 12px;
+        }
+
+        .health-main {
+            min-width: 0;
+        }
+
+        .health-name {
+            font-size: 13px;
+            font-weight: 700;
+            color: var(--text-main);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .health-meta {
+            font-size: 10.5px;
+            color: var(--text-sub);
+            margin-top: 3px;
+        }
+
+        .health-badge {
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.6px;
+            padding: 4px 9px;
+            border-radius: 999px;
+            text-transform: uppercase;
+            white-space: nowrap;
+        }
+
+        .badge-active {
+            background: rgba(52, 211, 153, 0.12);
+            border: 1px solid rgba(52, 211, 153, 0.35);
+            color: #34d399;
+        }
+
+        .badge-suspended {
+            background: rgba(248, 113, 113, 0.12);
+            border: 1px solid rgba(248, 113, 113, 0.35);
+            color: #f87171;
+        }
+
+        .badge-quarantined {
+            background: rgba(251, 191, 36, 0.12);
+            border: 1px solid rgba(251, 191, 36, 0.35);
+            color: var(--gold);
+        }
     </style>
 </head>
 <body>
@@ -524,6 +596,17 @@
             </button>
         </div>
 
+        <!-- Account Health Card -->
+        <div class="premium-card">
+            <div class="card-header-flex">
+                <span class="card-title">Account Health</span>
+                <div class="live-pill" id="health-summary">No accounts</div>
+            </div>
+            <div class="health-list" id="account-health-list">
+                <div class="health-empty">No accounts loaded.</div>
+            </div>
+        </div>
+
         <!-- Terminal Logs Card with Traffic Lights & Clear Button -->
         <div class="premium-card">
             <div class="card-header-flex" style="margin-bottom: 14px; padding-bottom: 10px;">
@@ -555,6 +638,10 @@
             <div class="form-group">
                 <label>Password</label>
                 <input type="password" id="modalPasswordInput" class="form-input" placeholder="Enter Password">
+            </div>
+            <div class="form-group">
+                <label>Proxy (optional)</label>
+                <input type="text" id="modalProxyInput" class="form-input" placeholder="socks5://user:pass@host:1080">
             </div>
             <div class="modal-actions">
                 <button class="modal-btn btn-cancel" onclick="closeAddAccountModal()">Cancel</button>
@@ -629,9 +716,65 @@
                 const maxCycle = 43200;
                 const pct = Math.min(100, ((uptimeSec % maxCycle) / maxCycle) * 100);
                 document.getElementById('session-progress-bar').style.width = pct + '%';
+                renderAccountHealth(stats);
             } catch (err) {
                 console.error('Error fetching stats:', err);
             }
+        }
+
+        function healthBadge(status) {
+            const label = String(status || 'active').toLowerCase();
+            const cls = ['active', 'suspended', 'quarantined'].includes(label) ? label : 'active';
+            return { text: label, className: `health-badge badge-${cls}` };
+        }
+
+        function renderAccountHealth(stats) {
+            const list = document.getElementById('account-health-list');
+            const accounts = Array.isArray(stats.accounts) ? stats.accounts : [];
+            const summary = stats.health || {};
+            const flagged = (summary.suspended || 0) + (summary.quarantined || 0);
+            document.getElementById('health-summary').textContent = accounts.length
+                ? `${accounts.length} account${accounts.length === 1 ? '' : 's'} · ${flagged} flagged`
+                : 'No accounts';
+
+            list.replaceChildren();
+            if (!accounts.length) {
+                const empty = document.createElement('div');
+                empty.className = 'health-empty';
+                empty.textContent = 'No accounts loaded.';
+                list.appendChild(empty);
+                return;
+            }
+
+            accounts.forEach((acc) => {
+                const health = acc.health || {};
+                const row = document.createElement('div');
+                row.className = 'health-row';
+
+                const main = document.createElement('div');
+                main.className = 'health-main';
+
+                const name = document.createElement('div');
+                name.className = 'health-name';
+                name.textContent = `${acc.nickname || 'Player'} · ${acc.uid || '?'}`;
+
+                const meta = document.createElement('div');
+                meta.className = 'health-meta';
+                const bits = [`Lvl ${acc.level || 1}`, acc.status || 'OFFLINE'];
+                if (health.proxy) bits.push(health.proxy);
+                if (health.error_count) bits.push(`${health.error_count} errors`);
+                if (health.reason) bits.push(health.reason);
+                meta.textContent = bits.join(' · ');
+
+                const badge = healthBadge(health.status);
+                const chip = document.createElement('span');
+                chip.className = badge.className;
+                chip.textContent = badge.text;
+
+                main.append(name, meta);
+                row.append(main, chip);
+                list.appendChild(row);
+            });
         }
 
         async function fetchLogs() {
@@ -680,21 +823,25 @@
             document.getElementById('addAccountModal').style.display = 'none';
             document.getElementById('modalUidInput').value = '';
             document.getElementById('modalPasswordInput').value = '';
+            document.getElementById('modalProxyInput').value = '';
         }
 
         async function submitAddAccount() {
             const uid = document.getElementById('modalUidInput').value.trim();
             const password = document.getElementById('modalPasswordInput').value.trim();
+            const proxy = document.getElementById('modalProxyInput').value.trim();
             if (!uid || !password) {
                 alert('Please enter both UID and Password');
                 return;
             }
 
             try {
+                const payload = { uid, password };
+                if (proxy) payload.proxy = proxy;
                 const res = await fetch('/api/account/add', {
                     method: 'POST',
                     headers: apiHeaders(),
-                    body: JSON.stringify({ uid, password })
+                    body: JSON.stringify(payload)
                 });
                 const data = await res.json();
                 if (data.status === 'ok') {

@@ -6,9 +6,12 @@ Ordered by impact ÷ effort. "Effort" is rough (S ≤ ½ day, M ≤ 2 days, L > 
 > added; rotating the leaked tokens is still an operator step) and #2 is
 > complete (localhost binding, API-key middleware on every write route, and
 > secret filtering on `/api/stats` and `/api/logs`). In P2, #18 (SQLite state)
-> and #19 (background-task draining) are complete — see
-> [P2 storage & testing milestone](#p2-storage--testing-milestone) and
-> [P0 #2 milestone](#p0-2-milestone-dashboard-auth--secret-filtering).
+> and #19 (background-task draining) are complete; #13 (bounded retries with a
+> permanent-failure state) is now covered by health quarantine. The latest
+> milestone adds webhook alerts, per-account proxies, and CI — see
+> [P2 storage & testing milestone](#p2-storage--testing-milestone),
+> [P0 #2 milestone](#p0-2-milestone-dashboard-auth--secret-filtering), and
+> [P3 notifications, health & CI milestone](#p3-notifications-health--ci-milestone).
 
 ## P0 — do first (security & correctness)
 
@@ -31,7 +34,7 @@ Ordered by impact ÷ effort. "Effort" is rough (S ≤ ½ day, M ≤ 2 days, L > 
 | 10 | Replace guessed packet parsing with schema-based parsing where possible; log+drop unparsable packets | Heuristics can accept the wrong invite/metrics | M |
 | 11 | Implement `relogin_account` (or delete the branch) | Cache expiry currently forces a full restart | S |
 | 12 | Run sync HTTP in `asyncio.to_thread` or `httpx.AsyncClient` in the dashboard | Dashboard freezes up to 15 s per token | S |
-| 13 | Cap retries with exponential backoff + jitter; surface a permanent-failure state | Infinite 15 s login loops and generator hangs | S |
+| 13 | ~~Cap retries with exponential backoff + jitter; surface a permanent-failure state~~ — **done** via health quarantine | Infinite 15 s login loops and generator hangs | S |
 | 14 | Add pytest tests for pure functions: `calculate_level_progress`, `create_proto`, `build_proto`, `crc7_buff`, `tea_*`, `decode_packet` round-trip, dashboard handlers | Zero tests today; these are cheap and catch real regressions | M |
 | 15 | Return structured JSON logs; render with `textContent` | Removes HTML-injection path and enables filtering | S |
 
@@ -118,18 +121,98 @@ Status: complete.
 Verification: `tests/smoke_test.py` now exercises all eight write routes without
 and with a key, the redaction helpers, and the live responses (52/52 checks).
 
+## P3 notifications, health & CI milestone
+
+Status: complete. Closes #13 (bounded retries plus a permanent-failure state)
+and adds the operational pieces the security/scale work needs.
+
+### Webhook notifications (`core/notifications.py`)
+
+- `SAHILOPS_WEBHOOK_URL` accepts a Discord webhook URL or a Telegram bot
+  `sendMessage` URL (`SAHILOPS_TELEGRAM_CHAT_ID` required for Telegram).
+- Alerts are queued and sent by one background worker with a bounded queue, so
+  a slow or dead endpoint cannot block a match, a login, or shutdown. Failures
+  are retried once and recorded; the bot keeps running.
+- Message text is scrubbed of JWT / `Bearer …` / `key=value` shapes before it
+  leaves the process.
+- Events: level-up (`refresh_account_profile`), match completion (`play_game`),
+  suspension/quarantine, exhausted reconnect attempts, and squad-formation
+  failure. Team/session events are throttled to one alert per 5 minutes per
+  account.
+- `main()` flushes the queue and stops the worker during shutdown.
+
+### Account health and quarantine (`core/health.py`, `core/storage.py`)
+
+- `accounts` gained `status` (`active` / `suspended` / `quarantined`),
+  `error_count`, `status_reason`, and `proxy` columns. Older databases are
+  altered in place on open, so no manual migration is needed.
+- Login and gateway responses (OAuth JSON, `MajorLogin`, `GetLoginData`, and
+  gateway exceptions) are scanned for ban/restriction phrases and codes
+  (`SAHILOPS_BAN_CODES`). A positive match marks the account `suspended`, pauses
+  it, and alerts; the worker exits instead of retrying a dead credential.
+- Other failures increment `error_count`; reaching `SAHILOPS_ERROR_THRESHOLD`
+  (default 5) marks the account `quarantined` and stops the worker. A successful
+  TCP connection resets the counter.
+- `_start_worker()` refuses to start workers for suspended/quarantined records.
+  The dashboard restart button reactivates the record, which is the explicit
+  retry path; re-adding an account also resets it to `active`.
+- `/api/stats` annotates each account with `health: {status, error_count,
+  reason, proxy}`, and the dashboard shows a badge per account plus a flagged
+  count. Proxy credentials are masked in every response.
+
+### Per-account proxies (`core/proxy.py`)
+
+- Accounts can carry a proxy (`http://`, `https://`, `socks5://`, `socks5h://`)
+  in SQLite; the dashboard add-account form accepts an optional proxy and
+  rejects unknown schemes.
+- HTTP calls (OAuth, `MajorLogin`, `GetLoginData`, ping) use a cached
+  per-proxy `httpx` client. Game gateway TCP connections are tunnelled through
+  the same proxy with a CONNECT or SOCKS5 handshake; DNS is left to the proxy
+  (no local resolution when a proxy is set).
+- `socks5://` resolves locally, `socks5h://` resolves at the proxy. The match
+  UDP socket is not tunnelled; it still leaves from the host's address.
+
+### CI (`.github/workflows/ci.yml`)
+
+- Runs on every push and pull request across Python 3.10–3.12: checkout, pip
+  install, `python -m compileall -q core dashboard utils`, then
+  `python tests/smoke_test.py`.
+- `requirements.txt` now installs `httpx[socks]` so SOCKS proxies work.
+
+### Verification
+
+```bash
+python -m compileall -q core dashboard utils   # clean
+.venv/bin/python tests/smoke_test.py           # 102/102 checks
+```
+
+The smoke test now also covers the schema upgrade on an old database, status
+and error-count transitions, suspension phrase/code detection (including false
+positives), HTTP and SOCKS5h tunnel round-trips against local fake proxies,
+webhook payload shapes and delivery/redaction, `/api/stats` health annotations,
+and proxy validation on the add-account route.
+
 ## Known limitations
 
 - **Battle Royale only.** `mode`/`LONE_WOLF` UI is vestigial.
 - **One process, many accounts.** No horizontal scaling; squad state is in memory.
 - **The squad bot still has no protocol test.** The smoke test covers storage,
-  the dashboard, squad sizing, and region override only; live match flow needs
-  real accounts and game servers.
+  the dashboard, health, proxies, alerts, squad sizing, and region override;
+  live match flow needs real accounts and game servers.
 - **Protocol constants are reverse-engineered guesses** (TEA layout, 660-char JWT
   split, movement packet tail bytes). A game patch can break them at any time.
 - **No account-level rate limiting.** Many accounts share one outbound IP and
   fixed device/version headers.
-- **No CI.** `tests/smoke_test.py` runs locally but nothing runs it on push.
+- **Match UDP traffic is not proxied.** TCP login, session, and ping requests
+  use the per-account proxy; the Battle Royale UDP socket still leaves from the
+  host's address.
+- **Ban detection is keyword/code based.** It cannot know a new restriction
+  format until its phrase or code is added to `core/health.py` /
+  `SAHILOPS_BAN_CODES`.
+- **Quarantine requires an explicit restart.** A quarantined account stays
+  stopped until the dashboard restart (or a re-add) clears it.
+- **Alerts are best-effort.** A dead webhook retries once, then drops the
+  message; nothing is persisted for later delivery.
 - **The dashboard key is a local access gate, not multi-user auth.** The page
   receives the key from the server, so anyone who can load it can send writes.
 - **Ethics/ToS:** the tool automates live game accounts; using it can get accounts

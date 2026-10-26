@@ -25,6 +25,14 @@ from protobuf_decoder.protobuf_decoder import Parser
 from core.message_ids import MESSAGE_ID_TO_NAME
 from core import thunderFF_pb2
 from core import storage
+from core import notifications
+from core import proxy as proxy_support
+from core.health import (
+    AccountSuspended,
+    ERROR_THRESHOLD,
+    detect_suspension,
+    is_quarantine_status,
+)
 
 from dashboard.dashboard_server import bot_state, start_web_dashboard
 
@@ -195,6 +203,112 @@ def optimize_udp_socket(sock):
 # ═══════════════════════════ HTTP CLIENT ═══════════════════════════
 client = httpx.AsyncClient(verify=False, timeout=10.0,
     limits=httpx.Limits(max_connections=100, max_keepalive_connections=50))
+
+# One reusable client per proxy string; direct accounts keep using ``client``.
+_proxy_http_clients: Dict[str, httpx.AsyncClient] = {}
+
+
+def http_client_for(proxy: Optional[str] = None):
+    """Return an httpx client that routes through ``proxy`` when one is set."""
+    try:
+        proxy = proxy_support.normalize_proxy(proxy)
+    except ValueError as e:
+        print_warning(f"[PROXY] {e}; using a direct connection")
+        return client
+    if not proxy:
+        return client
+    cached = _proxy_http_clients.get(proxy)
+    if cached is None or cached.is_closed:
+        cached = httpx.AsyncClient(
+            proxy=proxy, verify=False, timeout=10.0,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+        _proxy_http_clients[proxy] = cached
+    return cached
+
+
+async def close_proxy_clients() -> None:
+    for proxy_url, proxy_client in list(_proxy_http_clients.items()):
+        try:
+            await proxy_client.aclose()
+        except Exception as e:
+            print_warning(f"[PROXY] close failed for {proxy_support.describe_proxy(proxy_url)}: {e}")
+    _proxy_http_clients.clear()
+
+
+def _storage_keys(uid, ad=None) -> Dict[str, str]:
+    """Storage lookup keys for whichever credential identifies this account."""
+    ad = ad or {}
+    if ad.get("auth_token"):
+        return {"token": str(ad["auth_token"])}
+    if ad.get("auth_uid"):
+        return {"uid": str(ad["auth_uid"])}
+    return {"uid": str(uid)}
+
+
+_alert_last: Dict[str, float] = {}
+
+
+async def _alert_throttled(key: str, event: str, message: str, uid=None,
+                           min_seconds: float = 300.0, **fields) -> None:
+    now = time.time()
+    if now - _alert_last.get(key, 0.0) < min_seconds:
+        return
+    _alert_last[key] = now
+    await notifications.alert(event, message, uid=uid, **fields)
+
+
+def _mark_account_unhealthy(uid, status: str) -> None:
+    """Stop the worker loops for an account and show the state on the dashboard."""
+    uid_str = str(uid)
+    candidates = {uid_str}
+    if bot_state.game_to_auth_id.get(uid_str):
+        candidates.add(str(bot_state.game_to_auth_id[uid_str]))
+    if bot_state.auth_to_game_id.get(uid_str):
+        candidates.add(str(bot_state.auth_to_game_id[uid_str]))
+    for key in candidates:
+        bot_state.paused_accounts.add(key)
+    try:
+        bot_state.update_status(uid_str, status)
+    except Exception:
+        pass
+    acc = bot_state.accounts.get(uid_str)
+    if acc:
+        acc["status"] = status
+
+
+async def _suspend_account(uid, ad, reason: str) -> None:
+    keys = _storage_keys(uid, ad)
+    try:
+        storage.set_account_status(**keys, status="suspended", reason=reason)
+    except Exception as e:
+        print_warning(f"[HEALTH] status save failed for {uid}: {e}")
+    _mark_account_unhealthy(uid, "SUSPENDED")
+    print_error(f"[HEALTH] {uid} suspended: {reason}")
+    await notifications.alert("suspended", reason, uid=str(uid))
+
+
+async def _quarantine_account(uid, ad, reason: str, error_count: int = 0) -> None:
+    _mark_account_unhealthy(uid, "QUARANTINED")
+    print_error(f"[HEALTH] {uid} quarantined after {error_count} errors: {reason}")
+    await notifications.alert("quarantine", reason, uid=str(uid),
+                              errors=error_count or None)
+
+
+async def _record_failure(uid, ad, reason: str) -> bool:
+    """Count a failure; return True when the account is now quarantined."""
+    keys = _storage_keys(uid, ad)
+    try:
+        result = storage.bump_account_error(**keys, reason=reason,
+                                            threshold=ERROR_THRESHOLD)
+    except Exception as e:
+        print_warning(f"[HEALTH] error count failed for {uid}: {e}")
+        return False
+    if result.get("quarantined"):
+        await _quarantine_account(uid, ad, reason, result.get("error_count", 0))
+        return True
+    return False
+
 headers = {
     'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
     'Connection': 'Keep-Alive', 'Accept-Encoding': 'gzip',
@@ -403,7 +517,7 @@ async def version_config():
         return lr, rv, su
     except Exception: return None
 
-async def get_access_token(uid, password):
+async def get_access_token(uid, password, proxy=None):
     url = "https://100067.connect.garena.com/oauth/guest/token/grant"
     hdrs = {
         "Host": "100067.connect.garena.com",
@@ -418,12 +532,18 @@ async def get_access_token(uid, password):
     }
     for attempt in range(5):
         try:
-            r = await client.post(url, headers=hdrs, data=data)
+            r = await http_client_for(proxy).post(url, headers=hdrs, data=data)
             if r.status_code == 200:
                 d = r.json()
                 oid = d.get("open_id"); at = d.get("access_token"); pf = d.get("platform", 4)
                 if oid and at: return oid, at, pf
+                reason = detect_suspension(d.get("error"), d.get("message"))
+                if reason: raise AccountSuspended(f"OAuth: {reason}", str(uid))
+            else:
+                reason = detect_suspension(r.text)
+                if reason: raise AccountSuspended(f"OAuth: {reason}", str(uid))
             if r.status_code == 429: await asyncio.sleep(1); continue
+        except AccountSuspended: raise
         except Exception: pass
         await asyncio.sleep(0.5)
     return None
@@ -655,14 +775,18 @@ async def build_majorlogin_payload(open_id, access_token, platform, client_versi
     except Exception as e:
         print_error(f"build_majorlogin_payload: {e}"); return None
 
-async def send_majorlogin(data, release_version, server_url):
+async def send_majorlogin(data, release_version, server_url, proxy=None):
     try:
         url = f"{server_url}MajorLogin" if server_url.endswith('/') else f"{server_url}/MajorLogin"
         hdrs = headers.copy(); hdrs["ReleaseVersion"] = str(release_version)
-        r = await client.post(url, headers=hdrs, data=data)
+        r = await http_client_for(proxy).post(url, headers=hdrs, data=data)
         if r.status_code != 200:
+            reason = detect_suspension(r.text)
+            if reason: raise AccountSuspended(f"gateway login: {reason}")
             print_error(f"[MAJORLOGIN] HTTP {r.status_code}"); return None
         c = r.content
+        reason = detect_suspension(c[:4096].decode("utf-8", "ignore"))
+        if reason: raise AccountSuspended(f"gateway login: {reason}")
         if len(c) < 40: return None
         for off in [0, 64] + list(range(128)):
             try:
@@ -670,19 +794,25 @@ async def send_majorlogin(data, release_version, server_url):
                 if m.region and m.token: return m
             except Exception: continue
         return None
+    except AccountSuspended: raise
     except Exception as e:
         print_error(f"[MAJORLOGIN] {e}"); return None
 
-async def send_getlogin(data, base_url, token, release_version):
+async def send_getlogin(data, base_url, token, release_version, proxy=None):
     try:
         url = f"{base_url.rstrip('/')}/GetLoginData"
         hdrs = headers.copy()
         hdrs["ReleaseVersion"] = release_version
         hdrs['Authorization'] = f"Bearer {token}"
         hdrs['Host'] = "clientbp.ppmainecoonghj.com"
-        r = await client.post(url, headers=hdrs, data=data)
-        if r.status_code != 200: return None
+        r = await http_client_for(proxy).post(url, headers=hdrs, data=data)
+        if r.status_code != 200:
+            reason = detect_suspension(r.text)
+            if reason: raise AccountSuspended(f"gateway session: {reason}")
+            return None
         c = r.content
+        reason = detect_suspension(c[:4096].decode("utf-8", "ignore"))
+        if reason: raise AccountSuspended(f"gateway session: {reason}")
         rp = thunderFF_pb2.GetLoginDataRes()
         ok = False
         try:
@@ -702,10 +832,11 @@ async def send_getlogin(data, base_url, token, release_version):
             dd = await parse_results(parsed)
         except Exception: pass
         return rp, dd
+    except AccountSuspended: raise
     except Exception: return None
 
 # ═══════════════════════════ HTTP PING ═══════════════════════════
-async def send_ping(account_id, token, release_version):
+async def send_ping(account_id, token, release_version, proxy=None):
     try:
         try: acc = int(account_id)
         except Exception: acc = 0
@@ -723,17 +854,17 @@ async def send_ping(account_id, token, release_version):
             'x-real-ip': PING_REAL_IP, 'x-request-start': str(now_ms),
             'x-unity-version': '2018.4.12f1',
         }
-        r = await client.post(PING_URL, headers=hdrs, content=payload, timeout=PING_TIMEOUT)
+        r = await http_client_for(proxy).post(PING_URL, headers=hdrs, content=payload, timeout=PING_TIMEOUT)
         return r.status_code == 200
     except Exception: return False
 
-async def ping_worker(account_id, token, release_version, region="ID"):
+async def ping_worker(account_id, token, release_version, region="ID", proxy=None):
     if not ENABLE_HTTP_PING: return
     uid_str = str(account_id); ok_count = 0; fails = 0
     try:
         await asyncio.sleep(5.0 + random.uniform(0, 2.0))
         while True:
-            ok = await send_ping(uid_str, token, release_version)
+            ok = await send_ping(uid_str, token, release_version, proxy=proxy)
             if ok:
                 ok_count += 1; fails = 0
                 if ok_count % 10 == 0: print_info(f"[PING] {uid_str} OK total={ok_count}")
@@ -1384,6 +1515,11 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         if completed:
             try: bot_state.increment_match(uid_str)
             except Exception: pass
+            try:
+                await notifications.alert(
+                    "match_complete", f"Match #{match_index} finished", uid=uid_str)
+            except Exception as e:
+                print_warning(f"[ALERT] match notification failed: {e}")
             if on_match_complete:
                 try: bot_state.spawn(on_match_complete())
                 except Exception as e: print_warning(f"[MATCH] post-match task: {e}")
@@ -1468,12 +1604,12 @@ async def _process_social_packet(raw_bytes, account_data, tag="MAIN"):
                 "user-agent": "UnityPlayer/2022.3.47f1", "accept": "*/*",
                 "x-unity-version": "2022.3.47f1",
             }
-            async with httpx.AsyncClient(verify=False, timeout=8.0) as s:
-                r = await s.post(url, headers=hdrs, content=payload)
-                if r.status_code == 200 and len(r.content) > 0:
-                    print_success(f"[FRIEND-{tag}] ✅ {target}")
-                else:
-                    print_warning(f"[FRIEND-{tag}] HTTP {r.status_code} for {target}")
+            r = await http_client_for(account_data.get('proxy')).post(
+                url, headers=hdrs, content=payload, timeout=8.0)
+            if r.status_code == 200 and len(r.content) > 0:
+                print_success(f"[FRIEND-{tag}] ✅ {target}")
+            else:
+                print_warning(f"[FRIEND-{tag}] HTTP {r.status_code} for {target}")
         except Exception as e:
             print_warning(f"[FRIEND-{tag}] confirm failed for {target}: {e}")
     except Exception as e:
@@ -1607,7 +1743,7 @@ async def _handle_team_invite(hex_data, pl, uid_str, current_account_data,
 # ═══════════════════════════ FUNCTIONAL (MAIN) — BATTLE ROYALE ONLY ═══════════════════════════
 async def functional_battle_royale(addrs, starter_packet, account_region, client_version,
                                     key, iv, account_id="", account_data=None,
-                                    account_level=2, max_reconnects=10):
+                                    account_level=2, max_reconnects=10, proxy=None):
     reconnects = 0
     ip, port = addrs.split(":")
     play_matches: List[asyncio.Task] = []
@@ -1758,6 +1894,9 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
 
             if final_cnt < target_size:
                 print_error(f"[TEAM] Only {final_cnt}/{target_size} joined — reconnecting to retry")
+                await _alert_throttled(
+                    f"team:{uid_str}", "team_failure",
+                    f"Only {final_cnt}/{target_size} squad members joined", uid=uid_str)
                 heartbeat_stop.set()
                 try: hb_task.cancel(); await hb_task
                 except Exception: pass
@@ -1884,13 +2023,18 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                 except Exception: pass
 
 
-                rip = await resolve_host_cloudflare(ip)
-                reader, writer = await asyncio.open_connection(rip, int(port))
+                # A proxy resolves the gateway host itself, so skip local DNS.
+                rip = ip if proxy else await resolve_host_cloudflare(ip)
+                reader, writer = await proxy_support.open_connection(rip, int(port), proxy)
                 _writer_ref["w"] = writer
                 try:
                     bot_state.register_writer(uid_str, writer)
                 except Exception as e:
                     print_warning(f"[FUNC] writer registration failed {uid_str}: {e}")
+                try:
+                    storage.reset_account_errors(**_storage_keys(uid_str, current_account_data))
+                except Exception as e:
+                    print_warning(f"[HEALTH] error reset failed for {uid_str}: {e}")
                 raw_sock = writer.get_extra_info('socket')
                 if raw_sock: optimize_tcp_socket(raw_sock)
                 await asyncio.sleep(bypass_hello_delay())
@@ -2114,6 +2258,8 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                         _team_state["leader_uid"] = None
                 await _team_member_leave(uid_str)
                 raise
+            except AccountSuspended:
+                raise
             except Exception as e:
                 if gateway_ping_task: gateway_ping_task.cancel()
                 print_error(f"[FUNC] TCP state {uid_str}: {e}")
@@ -2121,6 +2267,16 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                 if writer:
                     try: writer.close(); await writer.wait_closed()
                     except Exception: pass
+
+                # A ban/restriction marker kills the worker; repeated failures
+                # quarantine it so the dashboard stops retrying dead credentials.
+                suspension = detect_suspension(str(e))
+                if suspension:
+                    await _suspend_account(uid_str, current_account_data,
+                                           f"gateway: {suspension}")
+                    raise AccountSuspended(f"gateway: {suspension}", uid_str)
+                if await _record_failure(uid_str, current_account_data, str(e)):
+                    raise AccountSuspended(f"quarantined: {e}", uid_str)
                 if "Cache expired" in str(e):
                     print_warning(f"[FUNC] re-login {uid_str}")
                     break
@@ -2128,6 +2284,9 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                 reconnects += 1
                 if reconnects > max_reconnects:
                     reconnects = 0
+                    await _alert_throttled(
+                        f"session:{uid_str}", "session_error",
+                        f"{max_reconnects} reconnect attempts failed: {e}", uid=uid_str)
                     await asyncio.sleep(3)
                     continue
                 await asyncio.sleep(bypass_human_reconnect_delay(reconnects))
@@ -2158,14 +2317,16 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
         raise
 
 # ═══════════════════════════ INFORMATIONAL ═══════════════════════════
-async def informational(addrs, starter_packet, key, iv, region="ID", max_reconnects=3):
+async def informational(addrs, starter_packet, key, iv, region="ID", max_reconnects=3,
+                       proxy=None):
     reconnects = 0
     ip, port = addrs.split(":")
     while True:
         writer = None; ping_task = None
         try:
-            rip = await resolve_host_cloudflare(ip)
-            reader, writer = await asyncio.open_connection(rip, int(port))
+            rip = ip if proxy else await resolve_host_cloudflare(ip)
+
+            reader, writer = await proxy_support.open_connection(rip, int(port), proxy)
             rs = writer.get_extra_info('socket')
             if rs: optimize_tcp_socket(rs)
             writer.write(bytes.fromhex(starter_packet)); await writer.drain()
@@ -2223,7 +2384,7 @@ async def refresh_account_profile(ad_or_uid):
         url = ad.get('server_url'); token = ad.get('token')
         rel = ad.get('release_version'); payload = ad.get('login_payload_data')
         if not (url and token and rel and payload): return
-        res = await send_getlogin(payload, url, token, rel)
+        res = await send_getlogin(payload, url, token, rel, proxy=ad.get('proxy'))
         if not res: return
         rp, dd = res
         def _si(v, d):
@@ -2259,35 +2420,53 @@ async def refresh_account_profile(ad_or_uid):
         if nick: ad['nickname'] = nick
         if old_lv > 0 and level > old_lv:
             print_success(f"[LEVEL UP] {acc_id}: {old_lv} -> {level}")
+            await notifications.alert(
+                "level_up", f"Level {old_lv} → {level}", uid=acc_id,
+                nickname=nick or None, total_exp=exp)
         elif old_ex != exp:
             print_success(f"[EXP] {acc_id} Lvl{level} +{exp - old_ex}")
-    except Exception: pass
+    except AccountSuspended:
+        raise
+    except Exception as e:
+        print_warning(f"[EXP] profile refresh failed: {e}")
 
-async def process_account_uid_pass(uid, password):
+def _stored_status(uid=None, token=None) -> str:
+    try:
+        rec = storage.get_account(uid=uid, token=token)
+    except Exception as e:
+        print_warning(f"[HEALTH] status read failed: {e}")
+        return "active"
+    return str((rec or {}).get("status") or "active")
+
+
+async def process_account_uid_pass(uid, password, proxy=None):
     cached = cache_get(uid)
     if cached:
         print_success(f"[CACHE] {uid} loaded")
+        if proxy: cached['proxy'] = proxy
         acc_id = str(cached['account_id'])
+        try: storage.set_account_status(uid=uid, status="active")
+        except Exception as e: print_warning(f"[HEALTH] status save failed for {uid}: {e}")
         bot_state.register_account(uid=acc_id,
             nickname=cached.get('nickname', f"Player_{acc_id}"),
             region=cached.get('region', 'ID'),
             level=cached.get('level', 1), exp=cached.get('exp', 0),
-            likes=cached.get('likes', 0))
+            likes=cached.get('likes', 0), auth_uid=uid)
         _register_credentials(cached); return cached
     print_info(f"[LOGIN] UID {uid}...")
     try:
         vc = await version_config()
         if not vc: return None
         rel, cv, su = vc
-        tg = await get_access_token(uid, password)
+        tg = await get_access_token(uid, password, proxy=proxy)
         if not tg: return None
         oid, at, pf = tg
         dev = get_device_for_account(uid)
         lpd = await build_majorlogin_payload(oid, at, pf, cv, dev)
         if not lpd: return None
-        mresp = await send_majorlogin(lpd, rel, su)
+        mresp = await send_majorlogin(lpd, rel, su, proxy=proxy)
         if mresp is None: return None
-        gl = await send_getlogin(lpd, mresp.url, mresp.token, rel)
+        gl = await send_getlogin(lpd, mresp.url, mresp.token, rel, proxy=proxy)
         if gl is None: return None
         rp, dd = gl
         acc_id = str(mresp.account_id)
@@ -2297,7 +2476,7 @@ async def process_account_uid_pass(uid, password):
         nick = rp.nickname or get_proto_field(dd, 4, f"Player_{acc_id}")
         region = mresp.region or get_proto_field(dd, 3, "ID")
         bot_state.register_account(uid=acc_id, nickname=nick, region=region,
-                                    level=level, exp=exp, likes=likes)
+                                    level=level, exp=exp, likes=likes, auth_uid=uid)
         print_success(f"[OK] {acc_id} | {nick} | Lvl{level} | BATTLE ROYALE")
         ad = {
             'account_id': mresp.account_id, 'nickname': nick, 'region': region,
@@ -2310,17 +2489,26 @@ async def process_account_uid_pass(uid, password):
             'release_version': rel, 'client_version': cv, 'server_url': mresp.url,
             'login_payload_data': lpd,
             'auth_type': 'guest', 'auth_uid': uid, 'auth_password': password,
+            'proxy': proxy or '',
         }
+        try: storage.set_account_status(uid=uid, status="active")
+        except Exception as e: print_warning(f"[HEALTH] status save failed for {uid}: {e}")
         _register_credentials(ad); cache_set(uid, ad); return ad
+    except AccountSuspended as e:
+        await _suspend_account(uid, {"auth_uid": uid}, e.reason)
+        raise
     except Exception as e:
         print_error(f"process_account_uid_pass: {e}")
         traceback.print_exc(); return None
 
-async def process_account_token(access_token):
+async def process_account_token(access_token, proxy=None):
     cache_key = f"tok_{access_token[:20]}"
     cached = cache_get(cache_key)
     if cached:
+        if proxy: cached['proxy'] = proxy
         acc_id = str(cached['account_id'])
+        try: storage.set_account_status(token=access_token, status="active")
+        except Exception as e: print_warning(f"[HEALTH] status save failed for token: {e}")
         bot_state.register_account(uid=acc_id,
             nickname=cached.get('nickname', f"Player_{acc_id}"),
             region=cached.get('region', 'ID'),
@@ -2343,9 +2531,9 @@ async def process_account_token(access_token):
         dev = get_device_for_account(oid)
         lpd = await build_majorlogin_payload(oid, access_token, str(pf), cv, dev)
         if not lpd: return None
-        mresp = await send_majorlogin(lpd, rel, su)
+        mresp = await send_majorlogin(lpd, rel, su, proxy=proxy)
         if mresp is None: return None
-        gl = await send_getlogin(lpd, mresp.url, mresp.token, rel)
+        gl = await send_getlogin(lpd, mresp.url, mresp.token, rel, proxy=proxy)
         if gl is None: return None
         rp, dd = gl
         acc_id = str(mresp.account_id)
@@ -2367,13 +2555,20 @@ async def process_account_token(access_token):
             'release_version': rel, 'client_version': cv, 'server_url': mresp.url,
             'login_payload_data': lpd,
             'auth_type': 'token', 'auth_token': access_token,
+            'proxy': proxy or '',
         }
+        try: storage.set_account_status(token=access_token, status="active")
+        except Exception as e: print_warning(f"[HEALTH] status save failed for token: {e}")
         _register_credentials(ad); cache_set(cache_key, ad); return ad
+    except AccountSuspended as e:
+        await _suspend_account(access_token[:16], {"auth_token": access_token}, e.reason)
+        raise
     except Exception as e:
         print_error(f"process_account_token: {e}"); return None
 
 async def run_account_worker(ad, label):
     acc_id = str(ad['account_id'])
+    proxy = ad.get('proxy') or None
     info_task = None; exp_task = None; ping_task = None
     try:
         reg = ad.get('region', 'ID')
@@ -2384,28 +2579,43 @@ async def run_account_worker(ad, label):
             ad['account_id'], ad['token'], ad['server_time'],
             ad['aes_ak'], ad['iv_i'], region=reg, typ='ChaT')
         info_task = asyncio.create_task(informational(ad['informational_addrs'], tcp_chat,
-                                                      ad['aes_ak'], ad['iv_i'], region=reg))
+                                                      ad['aes_ak'], ad['iv_i'], region=reg,
+                                                      proxy=proxy))
         if ENABLE_HTTP_PING:
-            ping_task = asyncio.create_task(ping_worker(acc_id, ad['token'], ad['release_version'], region=reg))
+            ping_task = asyncio.create_task(ping_worker(acc_id, ad['token'], ad['release_version'],
+                                                        region=reg, proxy=proxy))
             print_success(f"[PING] Started {acc_id}")
 
         async def exp_refresher():
-            try:
+            async def refresh_once():
                 f = bot_state.account_credentials.get(acc_id)
                 if f: await refresh_account_profile(f)
-            except Exception: pass
+            try:
+                await refresh_once()
+            except AccountSuspended as e:
+                await _suspend_account(acc_id, ad, e.reason)
+                bot_state.close_writers_for_account(acc_id)
+                return
+            except Exception as e:
+                print_warning(f"[EXP] refresh failed for {acc_id}: {e}")
             while True:
                 await asyncio.sleep(EXP_REFRESH_INTERVAL + random.uniform(-3.0, 3.0))
                 try:
-                    f = bot_state.account_credentials.get(acc_id)
-                    if f: await refresh_account_profile(f)
-                except Exception: pass
+                    await refresh_once()
+                except AccountSuspended as e:
+                    await _suspend_account(acc_id, ad, e.reason)
+                    bot_state.close_writers_for_account(acc_id)
+                    return
+                except Exception as e:
+                    print_warning(f"[EXP] refresh failed for {acc_id}: {e}")
         exp_task = asyncio.create_task(exp_refresher())
         # ⭐ Always Battle Royale
         await functional_battle_royale(ad['functional_addrs'], tcp_online, ad['region'], ad['client_version'],
             ad['aes_ak'], ad['iv_i'], account_id=acc_id, account_data=ad,
-            account_level=int(ad.get('level', 2) or 2))
+            account_level=int(ad.get('level', 2) or 2), proxy=proxy)
     except asyncio.CancelledError: raise
+    except AccountSuspended:
+        raise
     except Exception as e: print_error(f"run_account_worker {label}: {e}")
     finally:
         for t in (info_task, exp_task, ping_task):
@@ -2415,17 +2625,23 @@ async def run_account_worker(ad, label):
                 try: await t
                 except Exception: pass
 
-async def account_loop_guest(uid, password):
+async def account_loop_guest(uid, password, proxy=None):
     while True:
+        status = _stored_status(uid=uid)
+        if is_quarantine_status(status):
+            print_warning(f"[HEALTH] {uid} is {status} — worker idle until a restart")
+            await asyncio.sleep(300); continue
         try:
             print_info(f"[LOGIN] Guest {uid}...")
             try: bot_state.update_status(str(uid), "CONNECTING")
             except Exception: pass
-            ad = await process_account_uid_pass(uid, password)
+            ad = await process_account_uid_pass(uid, password, proxy=proxy)
             if not ad:
-                print_error(f"Login failed {uid}, retry 15s")
+                print_error(f"Login failed {uid}")
                 try: bot_state.update_status(str(uid), "ERROR")
                 except Exception: pass
+                if await _record_failure(uid, {"auth_uid": uid}, "login failed"):
+                    break
                 await asyncio.sleep(15); continue
             await run_account_worker(ad, uid)
             print_warning(f"Session end {uid}, reconnect 3s")
@@ -2435,23 +2651,37 @@ async def account_loop_guest(uid, password):
             try: bot_state.update_status(str(uid), "OFFLINE")
             except Exception: pass
             break
+        except AccountSuspended as e:
+            _mark_account_unhealthy(uid, "SUSPENDED")
+            print_error(f"Worker {uid} stopped: {e}")
+            break
         except Exception as e:
             print_error(f"Error {uid}: {e}, retry 10s")
             await asyncio.sleep(10)
 
-async def account_loop_token(token):
+async def account_loop_token(token, proxy=None):
     label = token[:10]
     while True:
+        status = _stored_status(token=token)
+        if is_quarantine_status(status):
+            print_warning(f"[HEALTH] token {label} is {status} — worker idle until a restart")
+            await asyncio.sleep(300); continue
         try:
-            ad = await process_account_token(token)
+            ad = await process_account_token(token, proxy=proxy)
             if not ad:
-                print_error("Login token fail, retry 15s")
+                print_error("Login token fail")
+                if await _record_failure(label, {"auth_token": token}, "token login failed"):
+                    break
                 await asyncio.sleep(15); continue
             acc_id = str(ad['account_id'])
             await run_account_worker(ad, acc_id)
             await asyncio.sleep(3)
         except asyncio.CancelledError:
             print_warning(f"Token {label} stopped"); break
+        except AccountSuspended as e:
+            _mark_account_unhealthy(label, "SUSPENDED")
+            print_error(f"Token {label} stopped: {e}")
+            break
         except Exception as e:
             print_error(f"Token error: {e}, retry 10s")
             await asyncio.sleep(10)
@@ -2476,23 +2706,41 @@ def _worker_key(rec):
     return None
 
 def _start_worker(rec):
+    status = str(rec.get("status") or "active").lower()
+    if is_quarantine_status(status):
+        label = str(rec.get("uid") or str(rec.get("token", ""))[:10] or "?")
+        print_warning(f"[HEALTH] {label} is {status} — not starting a worker (restart to retry)")
+        _mark_account_unhealthy(label, "SUSPENDED" if status == "suspended" else "QUARANTINED")
+        return None
+    proxy = rec.get("proxy") or None
     if rec.get("token"):
         t = str(rec["token"]).strip()
-        task = asyncio.create_task(account_loop_token(t))
+        task = asyncio.create_task(account_loop_token(t, proxy=proxy))
         bot_state.account_workers[t[:10]] = task
         return task
     if rec.get("uid") and rec.get("password"):
         u = str(rec["uid"]).strip(); p = str(rec["password"]).strip()
-        task = asyncio.create_task(account_loop_guest(u, p))
+        task = asyncio.create_task(account_loop_guest(u, p, proxy=proxy))
         bot_state.account_workers[u] = task
         return task
     return None
 
 async def on_account_added(data):
+    if not isinstance(data, dict):
+        return
+    try:
+        storage.set_account_status(uid=data.get("uid"), token=data.get("token"), status="active")
+    except Exception as e:
+        print_warning(f"[HEALTH] add status reset failed: {e}")
+    data["status"] = "active"
     _start_worker(data)
 
 async def on_refresh_account(uid):
-    await refresh_account_profile(uid)
+    try:
+        await refresh_account_profile(uid)
+    except AccountSuspended as e:
+        ad = bot_state.account_credentials.get(str(uid)) or {"auth_uid": str(uid)}
+        await _suspend_account(uid, ad, e.reason)
 
 async def _stop_worker(key):
     task = bot_state.account_workers.pop(key, None)
@@ -2509,13 +2757,18 @@ async def _restart_account_impl(uid):
     records = load_accounts()
     if uid:
         lookup = {uid}
-        if uid in bot_state.auth_to_game_id:
-            lookup.add(str(bot_state.auth_to_game_id[uid]))
-        if uid in bot_state.game_to_auth_id:
-            lookup.add(str(bot_state.game_to_auth_id[uid]))
+        cred = bot_state.account_credentials.get(uid) or {}
+        for mapped in (bot_state.auth_to_game_id.get(uid),
+                       bot_state.game_to_auth_id.get(uid),
+                       cred.get("auth_uid"), cred.get("account_id")):
+            if mapped:
+                lookup.add(str(mapped))
+        auth_token = str(cred.get("auth_token") or "")
         records = [
             r for r in records
-            if str(r.get("uid", "")) in lookup or _worker_key(r) in lookup
+            if str(r.get("uid", "")) in lookup
+            or _worker_key(r) in lookup
+            or (auth_token and str(r.get("token") or "") == auth_token)
         ]
     if not records:
         bot_state.log(f"Restart failed: no saved credentials for {uid or 'any account'}",
@@ -2539,6 +2792,13 @@ async def _restart_account_impl(uid):
                 except Exception: pass
         try: bot_state.update_status(str(rec.get("uid") or key), "RESTARTING")
         except Exception: pass
+        # A restart is the explicit retry: clear suspension/quarantine first.
+        try:
+            storage.set_account_status(uid=rec.get("uid") or None,
+                                       token=rec.get("token") or None, status="active")
+        except Exception as e:
+            print_warning(f"[HEALTH] reactivate failed for {key}: {e}")
+        rec["status"] = "active"; rec["error_count"] = 0
         await asyncio.sleep(0.3)
         _start_worker(rec)
         await asyncio.sleep(0.2)
@@ -2576,6 +2836,11 @@ async def main():
         bot_state.refresh_callbacks["on_restart_account"] = on_restart_account
     except Exception: pass
 
+    if notifications.notifier.enabled:
+        print_success(f"[ALERT] Webhook enabled ({notifications.notifier.kind})")
+    else:
+        print_info("[ALERT] Webhook disabled (set SAHILOPS_WEBHOOK_URL to enable)")
+
     accounts = load_accounts()
     if not accounts:
         print_warning(f"No accounts in {storage.DB_PATH}. Add via dashboard.")
@@ -2593,6 +2858,15 @@ async def main():
         if workers:
             await asyncio.gather(*workers, return_exceptions=True)
         await bot_state.drain()
+        try:
+            await notifications.notifier.close()
+        except Exception as e:
+            print_warning(f"Alert shutdown: {e}")
+        await close_proxy_clients()
+        try:
+            await client.aclose()
+        except Exception as e:
+            print_warning(f"HTTP client shutdown: {e}")
         if runner is not None:
             try:
                 await runner.cleanup()

@@ -1,4 +1,4 @@
-httpx
+httpx[socks]
 google-play-scraper
 pycryptodome
 protobuf-decoder

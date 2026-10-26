@@ -32,6 +32,7 @@ from core import encode_id_clan_pb2
 from core import data_pb2
 from core import output_pb2
 from core import storage
+from core.proxy import describe_proxy, normalize_proxy
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -264,19 +265,81 @@ async def handle_get_stats(request: web.Request) -> web.Response:
     exp_per_hour = int((total_gained / uptime_sec) * 3600)
     total_active_matches = sum(acc.get("active_matches", 0) for acc in accounts_data)
 
+    # Health/proxy live in SQLite, not in the engine's in-memory account dicts.
+    records_by_key: Dict[str, Dict[str, Any]] = {}
+    try:
+        for rec in storage.list_accounts():
+            for key in (rec.get("uid"), rec.get("token")):
+                if key:
+                    records_by_key.setdefault(str(key), rec)
+    except Exception as e:
+        bot_state.log(f"Health lookup failed: {e}", "warning")
+
+    def _health_for(rec: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            proxy_label = describe_proxy(rec.get("proxy")) if rec.get("proxy") else ""
+        except Exception:
+            proxy_label = "invalid proxy"
+        return {
+            "status": str(rec.get("status") or "active"),
+            "error_count": int(rec.get("error_count") or 0),
+            "reason": str(rec.get("status_reason") or ""),
+            "proxy": proxy_label,
+        }
+
+    matched_records = set()
     for acc in accounts_data:
         uid_k = str(acc.get("uid", ""))
         acc["uptime_seconds"] = bot_state.get_account_uptime(uid_k)
         acc["is_paused"] = bot_state.is_paused(uid_k)
 
+        rec = (records_by_key.get(uid_k)
+               or records_by_key.get(str(acc.get("auth_uid") or ""))
+               or records_by_key.get(str(acc.get("token") or ""))
+               or {})
+        if rec:
+            matched_records.add(id(rec))
+        acc["health"] = _health_for(rec)
+
+    # Persisted accounts with no running worker (for example quarantined at
+    # startup) still need to appear so the dashboard can highlight them.
+    listed_records = set()
+    for rec in records_by_key.values():
+        if id(rec) in matched_records or id(rec) in listed_records:
+            continue
+        listed_records.add(id(rec))
+        rec_uid = str(rec.get("uid") or str(rec.get("token") or "")[:10] or "?")
+        level = int(rec.get("level") or 1)
+        accounts_data.append({
+            "uid": rec_uid,
+            "auth_uid": str(rec.get("auth_uid") or ""),
+            "nickname": str(rec.get("nickname") or f"Player_{rec_uid[:6]}"),
+            "region": str(rec.get("region") or "-"),
+            "level": level,
+            "current_exp": int(rec.get("exp") or 0),
+            "gained_exp": 0,
+            "status": "OFFLINE",
+            "active_matches": 0,
+            "is_paused": True,
+            "uptime_seconds": 0,
+            "health": _health_for(rec),
+        })
+
+    accounts_data.sort(key=lambda x: x.get("gained_exp", 0), reverse=True)
+    health_summary: Dict[str, int] = {"active": 0, "suspended": 0, "quarantined": 0}
+    for acc in accounts_data:
+        status = acc["health"]["status"]
+        health_summary[status] = health_summary.get(status, 0) + 1
+
     return web.json_response(redact_secrets({
-        "total_accounts": len(bot_state.accounts),
+        "total_accounts": len(accounts_data),
         "total_matches": bot_state.total_matches,
         "total_matches_started": bot_state.total_matches_started,   # 🔥 NEW
         "total_active_matches": total_active_matches,
         "total_gained_exp": total_gained,
         "exp_per_hour": exp_per_hour,
         "accounts": accounts_data,
+        "health": health_summary,
         "logs": bot_state.logs[-80:],
         "uptime": uptime_sec
     }))
@@ -839,6 +902,16 @@ async def handle_add_account(request: web.Request) -> web.Response:
             identifier = f"Token_{token[:8]}..."
         else:
             return web.json_response({"status": "error", "error": "Invalid payload"})
+
+        proxy = data.get("proxy")
+        if proxy is not None:
+            proxy = str(proxy).strip()
+            if proxy:
+                try:
+                    proxy = normalize_proxy(proxy)
+                except ValueError as e:
+                    return web.json_response({"status": "error", "error": f"Proxy: {e}"}, status=400)
+                record["proxy"] = proxy
 
         try:
             storage.upsert_account(record)
