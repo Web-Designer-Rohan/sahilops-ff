@@ -947,13 +947,36 @@ async def handle_refresh_account(request: web.Request) -> web.Response:
 
 async def handle_restart_account(request: web.Request) -> web.Response:
     try:
-        data = await request.json()
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
         uid = str(data.get("uid", "")).strip()
-        if "on_restart_account" in bot_state.refresh_callbacks:
-            asyncio.create_task(bot_state.refresh_callbacks["on_restart_account"](uid))
-        elif "on_refresh_account" in bot_state.refresh_callbacks:
-            asyncio.create_task(bot_state.refresh_callbacks["on_refresh_account"](uid))
-        return web.json_response({"status": "ok"})
+        callback = bot_state.refresh_callbacks.get("on_restart_account")
+        if not callback:
+            return web.json_response(
+                {"status": "error", "error": "Restart is not available"}, status=503)
+        if uid:
+            known = (
+                uid in bot_state.account_workers
+                or uid in bot_state.accounts
+                or uid in bot_state.account_credentials
+                or uid in bot_state.auth_to_game_id
+                or uid in bot_state.game_to_auth_id
+            )
+            if not known:
+                return web.json_response(
+                    {"status": "error", "error": f"Unknown account: {uid}"}, status=404)
+
+        async def run_restart():
+            try:
+                await callback(uid)
+            except Exception as e:
+                bot_state.log(f"Restart failed for {uid or 'all'}: {e}",
+                              "warning", uid or None)
+
+        asyncio.create_task(run_restart())
+        return web.json_response({"status": "ok", "restarted": uid or "all"})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
 
@@ -998,7 +1021,7 @@ async def handle_api_logs(request: web.Request) -> web.Response:
 
 # ==================== START WEB DASHBOARD ====================
 
-async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
+async def start_web_dashboard(host: str = "127.0.0.1", port: int = 5000):
     app = web.Application()
     app.router.add_get("/", handle_index)
     app.router.add_post("/api/clanjoin", handle_api_clan_join)

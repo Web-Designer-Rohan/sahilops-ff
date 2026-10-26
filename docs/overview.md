@@ -25,8 +25,9 @@ automation workspace. It does three separate jobs:
   (`BR_MODE_ID = 1`, `BR_MAP_ID = 1`, `core/app.py`).
 - **UDP match client** — custom OICQ/tea-CBC framing, HELLO/ACK/PING replies,
   anti-AFK fire packets, and movement routines (`core/app.py`).
-- **Web dashboard** — `http://localhost:20333` with guild XP, uptime, live logs,
-  add-account, and pause/resume controls.
+- **Web dashboard** — `http://localhost:20333` (bound to `127.0.0.1` by default)
+  with guild XP, uptime, live logs, add-account, and pause/resume/restart
+  controls.
 - **EXP tracking** — polls `GetLoginData` every ~30 s and computes level
   progress from the built-in EXP table (`dashboard/dashboard_server.py`).
 - **Guild tools** — HTTP APIs for guild XP and mass clan-join using cached
@@ -40,6 +41,8 @@ automation workspace. It does three separate jobs:
   resume.
 - Squad target size adapts to the number of active account workers instead of
   requiring exactly four accounts.
+- The dashboard binds `127.0.0.1` by default, restart really relaunches worker
+  tasks, and opening the page no longer sends clan-join requests.
 
 ## What it is not
 

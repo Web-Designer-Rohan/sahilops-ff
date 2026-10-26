@@ -28,7 +28,7 @@ from core import thunderFF_pb2
 from dashboard.dashboard_server import bot_state, start_web_dashboard
 
 # ═══════════════════════════ CONFIG ═══════════════════════════
-WEB_HOST = "0.0.0.0"
+WEB_HOST = os.environ.get("SAHILOPS_HOST", "127.0.0.1")
 WEB_PORT = 20333
 ACCOUNTS_FILE = os.path.join(BASE_DIR, "accounts.json")
 TOKEN_CACHE_FILE = os.path.join(BASE_DIR, "token_cache.json")
@@ -2485,6 +2485,90 @@ def load_accounts():
         accounts.append({"uid": FALLBACK_UID, "password": FALLBACK_PASSWORD})
     return accounts
 
+_restart_lock = asyncio.Lock()
+
+def _worker_key(rec):
+    if rec.get("token"):
+        return str(rec["token"]).strip()[:10]
+    if rec.get("uid"):
+        return str(rec["uid"]).strip()
+    return None
+
+def _start_worker(rec):
+    if rec.get("token"):
+        t = str(rec["token"]).strip()
+        task = asyncio.create_task(account_loop_token(t))
+        bot_state.account_workers[t[:10]] = task
+        return task
+    if rec.get("uid") and rec.get("password"):
+        u = str(rec["uid"]).strip(); p = str(rec["password"]).strip()
+        task = asyncio.create_task(account_loop_guest(u, p))
+        bot_state.account_workers[u] = task
+        return task
+    return None
+
+async def on_account_added(data):
+    _start_worker(data)
+
+async def on_refresh_account(uid):
+    await refresh_account_profile(uid)
+
+async def _stop_worker(key):
+    task = bot_state.account_workers.pop(key, None)
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+
+async def _restart_account_impl(uid):
+    uid = str(uid or "").strip()
+    records = load_accounts()
+    if uid:
+        lookup = {uid}
+        if uid in bot_state.auth_to_game_id:
+            lookup.add(str(bot_state.auth_to_game_id[uid]))
+        if uid in bot_state.game_to_auth_id:
+            lookup.add(str(bot_state.game_to_auth_id[uid]))
+        records = [
+            r for r in records
+            if str(r.get("uid", "")) in lookup or _worker_key(r) in lookup
+        ]
+    if not records:
+        bot_state.log(f"Restart failed: no saved credentials for {uid or 'any account'}",
+                      "warning", uid or None)
+        return
+
+    if not uid:
+        # Restarting everything also resumes a paused rotation.
+        for acc in bot_state.accounts.values():
+            acc["is_paused"] = False
+        bot_state.paused_accounts.clear()
+
+    for rec in records:
+        key = _worker_key(rec)
+        if not key:
+            continue
+        await _stop_worker(key)
+        for candidate in {key, str(rec.get("uid", "")), uid}:
+            if candidate and bot_state.is_paused(candidate):
+                try: bot_state.toggle_pause(candidate)
+                except Exception: pass
+        try: bot_state.update_status(str(rec.get("uid") or key), "RESTARTING")
+        except Exception: pass
+        await asyncio.sleep(0.3)
+        _start_worker(rec)
+        await asyncio.sleep(0.2)
+
+    label = uid or f"all {len(records)} account(s)"
+    bot_state.log(f"🔁 Restart requested: {label}", "success", uid or None)
+
+async def on_restart_account(uid):
+    async with _restart_lock:
+        await _restart_account_impl(uid)
+
 # ═══════════════════════════ MAIN ═══════════════════════════
 async def main():
     print_colored("=" * 60, Colors.CYAN)
@@ -2500,38 +2584,21 @@ async def main():
 
     try:
         await start_web_dashboard(host=WEB_HOST, port=WEB_PORT)
-        print_success(f"Dashboard: http://localhost:{WEB_PORT}")
+        shown = "localhost" if WEB_HOST in ("127.0.0.1", "0.0.0.0", "::1", "::") else WEB_HOST
+        print_success(f"Dashboard: http://{shown}:{WEB_PORT} (bind {WEB_HOST})")
     except Exception as e: print_error(f"Dashboard: {e}")
-
-    async def on_account_added(data):
-        if "token" in data and data["token"]:
-            t = str(data["token"]).strip()
-            task = asyncio.create_task(account_loop_token(t))
-            bot_state.account_workers[t[:10]] = task
-        elif "uid" in data and "password" in data:
-            u = str(data["uid"]).strip(); p = str(data["password"]).strip()
-            task = asyncio.create_task(account_loop_guest(u, p))
-            bot_state.account_workers[u] = task
-
-    async def on_refresh_account(uid):
-        await refresh_account_profile(uid)
 
     try:
         bot_state.refresh_callbacks["on_account_added"] = on_account_added
         bot_state.refresh_callbacks["on_refresh_account"] = on_refresh_account
+        bot_state.refresh_callbacks["on_restart_account"] = on_restart_account
     except Exception: pass
 
     accounts = load_accounts()
     if not accounts:
         print_warning(f"No accounts in {ACCOUNTS_FILE}. Add via dashboard.")
     for acc in accounts:
-        if acc.get("token"):
-            t = asyncio.create_task(account_loop_token(acc["token"]))
-            bot_state.account_workers[acc["token"][:10]] = t
-        elif acc.get("uid") and acc.get("password"):
-            u = str(acc["uid"])
-            t = asyncio.create_task(account_loop_guest(u, acc["password"]))
-            bot_state.account_workers[u] = t
+        _start_worker(acc)
 
     try:
         while True: await asyncio.sleep(1)

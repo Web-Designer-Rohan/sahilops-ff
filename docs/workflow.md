@@ -27,8 +27,10 @@ Put accounts in `accounts.json` at the repository root:
    Expect a `SahilOps` banner, then
    `Dashboard: http://localhost:20333`.
 
-2. **Open** `http://localhost:20333`. You will see the guild XP card, session
-   uptime bar, log terminal, `+ Add Account`, and `Stop Bot`.
+2. **Open** `http://localhost:20333`. The server binds `127.0.0.1` by default;
+   set `SAHILOPS_HOST=0.0.0.0` only when you really need LAN access. You will
+   see the guild XP card, session uptime bar, log terminal, `+ Add Account`,
+   and `Stop Bot`.
 
 3. **Add accounts** — click `+ Add Account`, enter the **UID** and password,
    then click **Save**.
@@ -71,10 +73,10 @@ Put accounts in `accounts.json` at the repository root:
 | Button | Actual effect |
 |---|---|
 | `+ Add Account` | `POST /api/account/add` → saves account, starts worker |
-| `Stop Bot` | `POST /api/account/pause_all` → sets pause flags and closes registered TCP writers; each loop waits while paused and reconnects on resume |
-| `Restart Bot` | `POST /api/account/restart` with `{}` → still a no-op (see bugs #3) |
+| `Stop Bot` | `POST /api/account/pause_all` → sets pause flags and closes registered TCP writers; each loop waits while paused |
+| `Restart Bot` | `POST /api/account/restart` with `{}` → clears pause flags, cancels the worker tasks, and relaunches them from `accounts.json` |
 | `Clear` (logs) | clears the in-memory log buffer |
-| page refresh | auto-POSTs `clanjoin` for a hard-coded clan (bugs #5) |
+| page refresh | reads stats and guild info only; it never joins a clan |
 
 ### HTTP API
 

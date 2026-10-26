@@ -23,7 +23,8 @@ pip install -r requirements.txt
 python -m core.app
 ```
 
-Open `http://localhost:20333` for the dashboard.
+Open `http://localhost:20333` for the dashboard. It binds `127.0.0.1` by
+default; set `SAHILOPS_HOST=0.0.0.0` if you need access from another machine.
 
 Accounts can be placed in `accounts.json`:
 

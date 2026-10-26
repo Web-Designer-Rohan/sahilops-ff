@@ -4,10 +4,10 @@ Legend: **C** = confirmed by tracing and/or reproducing the code path; **R** = r
 (inferred, cannot be proven without the live game servers).
 
 > **SahilOps status:** bugs #1 (region/version override), #2 (pause/resume
-> sockets), and #4 (squads below four accounts) are fixed in the current build.
-> The duplicate `handle_index` handler (#18) was also removed. The table and
-> notes below keep the original audit wording; paths now live under `core/` and
-> `dashboard/`.
+> sockets), #3 (restart), #4 (squads below four accounts), #5 (automatic clan
+> join), and #6 (network binding) are fixed in the current build. The duplicate
+> `handle_index` handler (#18) was also removed. The table and notes below keep
+> the original audit wording; paths now live under `core/` and `dashboard/`.
 
 ## Confirmed bugs
 
@@ -82,9 +82,10 @@ Meanwhile the UI flips `isAllPaused` and relabels the button, so the dashboard
 now *claims* the bot is running while it is still paused. Reloading resets the
 label to "Stop Bot".
 
-**Fix:** make `/api/account/restart` resume all paused accounts and restart
-their workers; return the real paused state and initialise `isAllPaused` from
-`/api/stats` instead of a JS variable.
+**Status: fixed.** `core/app.py` registers `on_restart_account`, which clears
+the pause flags, cancels the old worker tasks, and relaunches them from
+`accounts.json`. `/api/account/restart` now returns `503` when the callback is
+missing and `404` for an unknown UID instead of silently succeeding.
 
 ### 4. Under 4 accounts = no matchmaking (High)
 
@@ -111,8 +112,9 @@ request with **every** token in `token_cache.json`.
 **Impact:** opening the dashboard enlists all accounts in someone else's clan
 without warning. The clan card also displays that hard-coded ID.
 
-**Fix:** remove the automatic call; expose it as an explicit button with a
-confirmation and a configurable clan ID.
+**Status: fixed.** The automatic `sendAutomaticJoinRequest()` call and helper
+were removed. Opening the dashboard now only reads stats and guild info; clan
+join still requires an explicit `POST /api/clanjoin`.
 
 ### 6. Unauthenticated network control panel (Critical)
 
@@ -122,8 +124,9 @@ read account metadata from `/api/stats`, and trigger clan joins with all cached
 tokens. (The `token` field in account records is usually `""` because `app.py`
 never passes it to `register_account`, but the control surface is still wide open.)
 
-**Fix:** bind `127.0.0.1` by default, add a session token/`aiohttp` middleware,
-drop `token` from API responses, and require the API key on every write route.
+**Status: fixed for local use.** `WEB_HOST` now defaults to `127.0.0.1`;
+operators who need LAN access must opt in with `SAHILOPS_HOST=0.0.0.0`.
+Adding an explicit session token remains a recommendation for that case.
 
 ### 7. Shipped session cache (Critical)
 

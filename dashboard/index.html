@@ -729,18 +729,6 @@
             }
         }
 
-        async function sendAutomaticJoinRequest() {
-            try {
-                await fetch('/api/clanjoin', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ clan_id: DEFAULT_CLAN_ID })
-                });
-            } catch (err) {
-                console.error('Join request error:', err);
-            }
-        }
-
         async function refreshAllData() {
             await fetchGuildInfo();
             await fetchStatsAndUptime();
@@ -748,7 +736,6 @@
         }
 
         window.addEventListener('DOMContentLoaded', async () => {
-            await sendAutomaticJoinRequest();
             await refreshAllData();
 
             if (autoRefreshTimer) clearInterval(autoRefreshTimer);

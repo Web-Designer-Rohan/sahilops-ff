@@ -2,9 +2,10 @@
 
 Ordered by impact ÷ effort. "Effort" is rough (S ≤ ½ day, M ≤ 2 days, L > 2 days).
 
-> **SahilOps status:** P0 #4 (region override), #5 (pause/resume writers), and
-> #7 (fewer than four accounts) are implemented in the current build. The rest
-> remain recommendations.
+> **SahilOps status:** P0 #3–#8 are implemented. #1 is partial (`.gitignore`
+> added; rotating the leaked tokens is still an operator step) and #2 is
+> partial (the dashboard now binds `127.0.0.1`; auth middleware and API secret
+> filtering remain recommendations).
 
 ## P0 — do first (security & correctness)
 
