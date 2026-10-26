@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+generator.log
+SahilOps/
+token_cache.json
+devices.json
+accounts.json
+guild_exp_cache.json

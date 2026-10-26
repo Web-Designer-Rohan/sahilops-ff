@@ -2,6 +2,10 @@
 
 Ordered by impact ÷ effort. "Effort" is rough (S ≤ ½ day, M ≤ 2 days, L > 2 days).
 
+> **SahilOps status:** P0 #4 (region override), #5 (pause/resume writers), and
+> #7 (fewer than four accounts) are implemented in the current build. The rest
+> remain recommendations.
+
 ## P0 — do first (security & correctness)
 
 | # | Change | Why | Effort |

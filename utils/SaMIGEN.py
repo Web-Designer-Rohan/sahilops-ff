@@ -39,8 +39,9 @@ GENERATE_NICKNAME_URL = "https://loginbp.ppmainecoonghj.com/GenerateNickname"
 GETLOGIN_HOST_IND   = "client.ind.freefiremobile.com"
 GETLOGIN_HOST_OTHER = "clientbp.ggpolarbear.com"
 
-ACCOUNTS_FILE = "accounts.json"
-LOG_FILE      = "generator.log"
+BASE_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ACCOUNTS_FILE = os.path.join(BASE_DIR, "accounts.json")
+LOG_FILE      = os.path.join(BASE_DIR, "generator.log")
 
 # Fixed value from working version — DO NOT randomize
 X_GA_SV = "1789636317"
@@ -55,7 +56,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     handlers=[logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")],
 )
-logger = logging.getLogger("ACCOUNT_GENERATOR")
+logger = logging.getLogger("SAHILOPS_GENERATOR")
 
 file_lock = threading.Lock()
 print_lock = threading.Lock()
@@ -325,7 +326,7 @@ def get_token_legacy(session, uid, password, ua):
 def generate_nickname(session, open_id):
     number = random.randint(10000, 99999)
     superscript = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
-    return str(number).translate(superscript) + "Rishu"
+    return str(number).translate(superscript) + "SahilOps"
 
 
 def send_major_register(session, name, access_token, open_id, ua, dev=None):
@@ -734,7 +735,7 @@ def create_one_account(worker_id: int, total: int, counters: dict):
 
             # Password
             random_suffix = hashlib.sha256(os.urandom(16)).hexdigest()[:12].upper()
-            password = f"Rishu_{random_suffix}"
+            password = f"SahilOps_{random_suffix}"
             L_info(f"  password: {password}")
 
             # STEP 1
@@ -849,7 +850,7 @@ def main():
 
     print()
     print("╔" + "═" * 66 + "╗")
-    print("║" + "   Rishu Gen".center(66) + "║")
+    print("║" + "   SahilOps Generator".center(66) + "║")
     print("╚" + "═" * 66 + "╝")
     print()
 

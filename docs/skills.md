@@ -1,7 +1,7 @@
 # Coding Skills
 
 Skills are instruction packs for the coding agent, not runtime dependencies of the
-bot. Installing them does not change `app.py` or add imports to the tool.
+bot. Installing them does not change `core/app.py` or add imports to the tool.
 
 ## Installed and relevant
 
@@ -9,7 +9,7 @@ bot. Installing them does not change `app.py` or add imports to the tool.
 
 | Skill | Source | Purpose | Why it fits |
 |---|---|---|---|
-| `async-python-patterns` | `wshobson/agents` (18K installs) | asyncio tasks, cancellation, timeouts, blocking-loop pitfalls | `app.py` is ~2,500 lines of asyncio with tasks, timeouts and swallowed cancels |
+| `async-python-patterns` | `wshobson/agents` (18K installs) | asyncio tasks, cancellation, timeouts, blocking-loop pitfalls | `core/app.py` is ~2,500 lines of asyncio with tasks, timeouts and swallowed cancels |
 | `python-testing-patterns` | `wshobson/agents` (36.9K installs) | pytest fixtures, mocking, async tests | repo has no tests; pure encode/decode helpers are easy wins |
 | `python-anti-patterns` | `wshobson/agents` | review checklist for common Python mistakes | audit found bare `except: pass`, duplicated config, dead code |
 
@@ -42,7 +42,7 @@ contains 12 entries, including the three new ones.
 | `agent-browser` | browser automation CLI | not needed (no web UI testing requested) |
 | `find-skills` | search/install skills | used to discover the Python skills |
 | `reverse-engineer-anything` | guide for binary/artifact analysis | used as the audit method (unpacked archives, traced artifacts) |
-| `rea-analysis-optimization`, `rea-ci-tests-audit`, `rea-changelog-update`, `rea-tool-design` | REA tooling for a different project (morluto/rea) | **irrelevant** to FF_Bot; left installed, harmless |
+| `rea-analysis-optimization`, `rea-ci-tests-audit`, `rea-changelog-update`, `rea-tool-design` | REA tooling for a different project (morluto/rea) | **irrelevant** to SahilOps; left installed, harmless |
 | `improve-codebase-architecture` | architecture review workflow | references a `codebase-design` skill that is **not installed**, so it cannot run end-to-end |
 | `grill-me` | "relentless interview" entry point | **broken stub:** its entire body is `Call the Skill tool with "grilling"`, and no `grilling` skill exists |
 

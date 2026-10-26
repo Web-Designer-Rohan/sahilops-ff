@@ -1,0 +1,9 @@
+httpx
+google-play-scraper
+pycryptodome
+protobuf-decoder
+protobuf>=6,<8
+requests
+aiohttp
+PyJWT
+urllib3
