@@ -13,26 +13,23 @@ import os
 import re
 import sys
 import time
+import uuid
 from typing import Dict, List, Any, Optional
 from aiohttp import web
 import urllib3
-import requests
 import httpx
 import jwt
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-from google.protobuf.json_format import MessageToDict
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from core import ReqCLan_pb2
-from core import encode_id_clan_pb2
-from core import data_pb2
-from core import output_pb2
 from core import storage
 from core.proxy import describe_proxy, normalize_proxy
+from utils import guild_lookup
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -154,76 +151,21 @@ def get_server_url(region):
     return info[0] if isinstance(info, tuple) else info
 
 def fetch_single_clan(clan_id, region, token_cache):
-    server_base, host = get_server_info(region)
-    url = f"{server_base}/GetClanInfoByClanID"
-
-    try:  
-        my_data = encode_id_clan_pb2.MyData()  
-        my_data.field1 = int(clan_id)  
-        my_data.field2 = 1  
-        payload = encrypt_payload(my_data.SerializeToString())  
-    except Exception as e:
-        return {"clan_id": clan_id, "error": f"Protobuf failed: {str(e)}"}
-
-    response = None
-    for uid, creds in token_cache.items():
-        token = creds.get('token')
-        if not token:
-            continue
-
-        headers = GAME_HEADERS.copy()
-        headers["Authorization"] = f"Bearer {token}" if not token.startswith("Bearer ") else token
-        headers["Host"] = host
-
-        try:
-            res = requests.post(url, headers=headers, data=payload, verify=False, timeout=15.0)
-            if res.status_code == 200:
-                response = res
-                break
-            elif "expired" in res.text.lower() or res.status_code == 401:
-                continue
-            else:
-                response = res
-                break
-        except Exception as ex:
-            continue
-
-    if not response or response.status_code != 200:
-        return {"clan_id": clan_id, "error": "All tokens failed or expired"}
-
-    full_response = {}
-    resp = None
+    """Compatibility wrapper around the shared guild lookup utility."""
     try:
-        resp = data_pb2.response()  
-        resp.ParseFromString(response.content)  
-        full_response = MessageToDict(resp, preserving_proto_field_name=True)
-    except Exception as e:
-        pass
+        clan_data = guild_lookup.fetch_guild_metadata(
+            clan_id, region=region, token_cache=token_cache
+        )
+    except guild_lookup.GuildLookupError as exc:
+        return {"clan_id": clan_id, "error": str(exc)}
+    except Exception as exc:
+        return {"clan_id": clan_id, "error": f"{type(exc).__name__}: {exc}"}
 
-    guild_xp = 0
-    if resp:
-        for field_desc, val in resp.ListFields():
-            if field_desc.number == 36 and isinstance(val, int):
-                guild_xp = val
-                break
-
-    if guild_xp == 0 and full_response:
-        guild_xp = int(full_response.get("field_36") or full_response.get("xp") or 0)
-
-    return {
-        "captain_id": getattr(resp, "captain_id", 0) if resp else full_response.get("captain_id", 0),
-        "clan_id": int(clan_id),
-        "clan_level": getattr(resp, "rank", 4) if resp else full_response.get("rank", 4),
-        "clan_name": getattr(resp, "special_code", None) if resp else (full_response.get("special_code") or f"Guild_{clan_id}"),
-        "current_officer": full_response.get("current_officer", 0),
-        "current_members": full_response.get("current_members", 1),                
-        "max_members": full_response.get("max_members", 50),
-        "Total guild xp": int(guild_xp),
-        "welcome_message": getattr(resp, "welcome_message", "") if resp else full_response.get("welcome_message", ""),
-        "region": region,
-        "xp": int(guild_xp),
-        "raw_response_bytes": response.content.hex()
-    }
+    clan_data.setdefault("captain_id", clan_data.get("leader_uid", 0))
+    clan_data.setdefault("current_officer", clan_data.get("leader_uid", 0))
+    clan_data.setdefault("welcome_message", "")
+    clan_data.setdefault("logo_url", guild_lookup.guild_logo_url(clan_id))
+    return clan_data
 
 async def request_clan_async(jwt_token, clan_id, region):
     server_url = get_server_url(region)
@@ -716,6 +658,327 @@ class BotState:
 
 bot_state = BotState()
 
+# ─────────────────────────── web guest generation ───────────────────────────
+# The browser never talks to Garena directly.  One job runs at a time, in a
+# worker thread, and the existing generator keeps its sequential pacing and
+# 429 backoff.  This prevents a double-click from opening parallel streams.
+GENERATION_REGIONS = {
+    "IN": ("IND", "IN"),
+    "IND": ("IND", "IN"),
+    "INDIA": ("IND", "IN"),
+    "ID": ("ID", "ID"),
+    "INDONESIA": ("ID", "ID"),
+    "SG": ("SG", "SG"),
+    "TH": ("TH", "TH"),
+    "MY": ("MY", "MY"),
+    "VN": ("VN", "VN"),
+    "PH": ("PH", "PH"),
+    "BR": ("BR", "BR"),
+    "PK": ("PK", "PK"),
+}
+try:
+    GENERATION_DEFAULT_DELAY = float(os.environ.get("SAHILOPS_ACCOUNT_DELAY", "8"))
+except (TypeError, ValueError):
+    GENERATION_DEFAULT_DELAY = 8.0
+GENERATION_MIN_DELAY = 2.0
+GENERATION_MAX_DELAY = 60.0
+GENERATION_MAX_ACCOUNTS = 10
+_generation_start_lock = asyncio.Lock()
+GENERATION_JOB: Dict[str, Any] = {
+    "job_id": None,
+    "status": "idle",
+    "count": 0,
+    "success": 0,
+    "failed": 0,
+    "rate_limited": 0,
+    "region": None,
+    "region_label": None,
+    "delay": 0.0,
+    "started_at": None,
+    "finished_at": None,
+    "error": None,
+    "created": [],
+    "counters": {},
+}
+
+
+def _generation_public_state() -> Dict[str, Any]:
+    state = dict(GENERATION_JOB)
+    state["created"] = [dict(item) for item in GENERATION_JOB.get("created", [])]
+    state["counters"] = dict(GENERATION_JOB.get("counters", {}))
+    return state
+
+
+def _generate_accounts_sync(count: int, region_code: str, region_label: str,
+                            delay: float) -> Dict[str, Any]:
+    """Blocking generator entry point; called through ``asyncio.to_thread``."""
+    from utils import SaMIGEN
+
+    return SaMIGEN.generate_accounts(
+        count,
+        region=region_code,
+        region_label=region_label,
+        delay=delay,
+    )
+
+
+def _account_summary(rec: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "uid": str(rec.get("uid") or ""),
+        "nickname": str(rec.get("nickname") or ""),
+        "region": str(rec.get("region") or ""),
+        "status": str(rec.get("status") or "active"),
+    }
+
+
+async def _run_generation_job(job_id: str, count: int, region_code: str,
+                              region_label: str, delay: float) -> None:
+    before = set()
+    try:
+        before = {str(rec.get("uid") or "") for rec in storage.list_accounts()}
+        counters = await asyncio.to_thread(
+            _generate_accounts_sync, count, region_code, region_label, delay
+        )
+        counters = counters if isinstance(counters, dict) else {}
+        created_records = [
+            rec for rec in storage.list_accounts()
+            if str(rec.get("uid") or "") not in before
+        ]
+        created = [_account_summary(rec) for rec in created_records]
+        success = int(counters.get("success", len(created)) or 0)
+        failed = int(counters.get("failed", 0) or 0)
+        rate_limited = int(counters.get("rate_limited", 0) or 0)
+        GENERATION_JOB.update({
+            "status": "completed",
+            "success": success,
+            "failed": failed,
+            "rate_limited": rate_limited,
+            "finished_at": time.time(),
+            "error": None if success else "No account was created — check System Activity Logs.",
+            "created": created,
+            "counters": counters,
+        })
+        bot_state.log(
+            f"Guest generation finished: {success}/{count} created, "
+            f"{failed} failed, {rate_limited} rate-limit backoff(s).",
+            "success" if success else "warning",
+        )
+
+        callback = bot_state.refresh_callbacks.get("on_account_added")
+        if callback:
+            for rec in created_records:
+                if not (rec.get("password") or rec.get("token")):
+                    continue
+                try:
+                    await callback(rec)
+                except Exception as exc:
+                    bot_state.log(
+                        f"Generated account {rec.get('uid')} could not start: {exc}",
+                        "warning",
+                        str(rec.get("uid") or "") or None,
+                    )
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        GENERATION_JOB.update({
+            "status": "failed",
+            "finished_at": time.time(),
+            "error": message,
+            "created": [],
+        })
+        bot_state.log(f"Guest generation failed: {message}", "warning")
+
+
+async def handle_generate_accounts(request: web.Request) -> web.Response:
+    if not api_key_ok(request):
+        return web.json_response(
+            {"status": "error", "error": "Unauthorized: invalid or missing API key"},
+            status=401,
+        )
+    try:
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+
+        try:
+            count = int(data.get("count", 1))
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"status": "error", "error": "count must be a number"}, status=400
+            )
+        if not (1 <= count <= GENERATION_MAX_ACCOUNTS):
+            return web.json_response(
+                {"status": "error",
+                 "error": f"count must be between 1 and {GENERATION_MAX_ACCOUNTS}"},
+                status=400,
+            )
+
+        region_key = str(data.get("region") or "IN").strip().upper().replace("-", "")
+        if region_key not in GENERATION_REGIONS:
+            return web.json_response(
+                {"status": "error",
+                 "error": "unsupported region; use IN, ID, SG, TH, MY, VN, PH, BR, or PK"},
+                status=400,
+            )
+        region_code, region_label = GENERATION_REGIONS[region_key]
+
+        try:
+            delay = float(data.get("delay", GENERATION_DEFAULT_DELAY))
+        except (TypeError, ValueError):
+            delay = GENERATION_DEFAULT_DELAY
+        delay = max(GENERATION_MIN_DELAY, min(GENERATION_MAX_DELAY, delay))
+
+        async with _generation_start_lock:
+            if GENERATION_JOB.get("status") == "running":
+                return web.json_response(
+                    {"status": "error",
+                     "error": "a guest generation job is already running",
+                     "job_id": GENERATION_JOB.get("job_id")},
+                    status=409,
+                )
+
+            job_id = uuid.uuid4().hex[:12]
+            GENERATION_JOB.update({
+                "job_id": job_id,
+                "status": "running",
+                "count": count,
+                "success": 0,
+                "failed": 0,
+                "rate_limited": 0,
+                "region": region_code,
+                "region_label": region_label,
+                "delay": delay,
+                "started_at": time.time(),
+                "finished_at": None,
+                "error": None,
+                "created": [],
+                "counters": {},
+            })
+            bot_state.spawn(
+                _run_generation_job(job_id, count, region_code, region_label, delay)
+            )
+
+        bot_state.log(
+            f"Guest generation queued: {count} account(s) · {region_label} · "
+            f"{delay:.1f}s sequential pacing",
+            "info",
+        )
+        return web.json_response({
+            "status": "started",
+            "job_id": job_id,
+            "count": count,
+            "region": region_code,
+            "region_label": region_label,
+            "delay": delay,
+        }, status=202)
+    except Exception as exc:
+        return web.json_response(
+            {"status": "error", "error": f"{type(exc).__name__}: {exc}"}, status=500
+        )
+
+
+async def handle_generate_status(request: web.Request) -> web.Response:
+    if not api_key_ok(request):
+        return web.json_response(
+            {"status": "error", "error": "Unauthorized: invalid or missing API key"},
+            status=401,
+        )
+    return web.json_response(redact_secrets(_generation_public_state()), status=200)
+
+
+# ─────────────────────────── guild target config ───────────────────────────
+GUILD_CONFIG_KEY = "guild_config"
+GUILD_REGIONS = ("IND", "ID", "SG", "TH", "MY", "VN", "PH", "BR", "PK")
+
+
+def _load_guild_config() -> Dict[str, str]:
+    raw = storage.kv_get(GUILD_CONFIG_KEY, {})
+    if not isinstance(raw, dict):
+        raw = {}
+    guild_id = str(raw.get("guild_id") or "").strip()
+    region = str(raw.get("region") or "IND").strip().upper()
+    if region == "IN":
+        region = "IND"
+    if region not in GUILD_REGIONS:
+        region = "IND"
+    return {"guild_id": guild_id, "region": region}
+
+
+def _guild_config_payload(config: Dict[str, str]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = dict(config)
+    guild_id = str(config.get("guild_id") or "").strip()
+    payload["logo_url"] = guild_lookup.guild_logo_url(guild_id) if guild_id else None
+    return payload
+
+
+async def handle_get_guild_config(request: web.Request) -> web.Response:
+    if not api_key_ok(request):
+        return web.json_response(
+            {"status": "error", "error": "Unauthorized: invalid or missing API key"},
+            status=401,
+        )
+    return web.json_response({
+        "status": "ok",
+        **_guild_config_payload(_load_guild_config()),
+    }, status=200)
+
+
+async def handle_save_guild_config(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            data = {}
+        guild_id = str(data.get("guild_id") or "").strip()
+        if guild_id and (not guild_id.isdigit() or len(guild_id) > 20):
+            return web.json_response(
+                {"status": "error", "error": "guild_id must be numeric"},
+                status=400,
+            )
+        region = str(data.get("region") or "IND").strip().upper()
+        if region == "IN":
+            region = "IND"
+        if region not in GUILD_REGIONS:
+            return web.json_response(
+                {"status": "error", "error": "unsupported guild region"},
+                status=400,
+            )
+        config = {"guild_id": guild_id, "region": region}
+        storage.kv_set(GUILD_CONFIG_KEY, config)
+        bot_state.log(
+            f"Guild target saved: {guild_id or 'cleared'} · {region}",
+            "success" if guild_id else "info",
+        )
+        return web.json_response({
+            "status": "ok",
+            **_guild_config_payload(config),
+        }, status=200)
+    except Exception as exc:
+        return web.json_response(
+            {"status": "error", "error": f"{type(exc).__name__}: {exc}"}, status=500
+        )
+
+
+async def handle_guild_badge(request: web.Request) -> web.Response:
+    raw = str(request.match_info.get("guild_id") or "")
+    guild_id = raw[:-4] if raw.endswith(".svg") else raw
+    if not guild_id.isdigit():
+        return web.Response(status=404)
+    svg = guild_lookup.guild_badge_svg(
+        guild_id,
+        name=request.query.get("name", ""),
+        level=request.query.get("level", 0),
+        members=request.query.get("members", 0),
+    )
+    return web.Response(
+        text=svg,
+        content_type="image/svg+xml",
+        charset="utf-8",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
 FALLBACK_INDEX_HTML = """<!DOCTYPE html>
 <html>
 <head><title>SahilOps Dashboard</title></head>
@@ -807,11 +1070,17 @@ def get_persisted_baseline_xp(clan_id, current_xp):
 
 async def handle_api_guild_info(request: web.Request) -> web.Response:
     try:
-        clan_id = request.query.get('guild_id') or request.query.get('clan_uid') or request.query.get('clan_id')
-        region = (request.query.get('region') or 'IND').upper()
-
         if not api_key_ok(request):
             return web.json_response({"error": "Unauthorized: Invalid or missing API key"}, status=401)
+
+        config = _load_guild_config()
+        clan_id = (request.query.get('guild_id')
+                   or request.query.get('clan_uid')
+                   or request.query.get('clan_id')
+                   or config.get("guild_id"))
+        region = guild_lookup.normalize_region(
+            request.query.get('region') or config.get("region") or "IND"
+        )
 
         if not clan_id:
             return web.json_response({"error": "guild_id is required"}, status=400)
@@ -822,12 +1091,21 @@ async def handle_api_guild_info(request: web.Request) -> web.Response:
             return web.json_response({"error": "Failed to load token cache", "details": str(e)}, status=503)
 
         if not token_cache:
-            return web.json_response({"error": "token cache is empty"}, status=503)
+            return web.json_response({
+                "error": "token cache is empty",
+                "guild_id": str(clan_id),
+                "logo_url": guild_lookup.guild_logo_url(clan_id),
+            }, status=503)
 
-        clan_data = fetch_single_clan(clan_id, region, token_cache)
+        # Synchronous requests must not block the aiohttp event loop.
+        clan_data = await asyncio.to_thread(fetch_single_clan, clan_id, region, token_cache)
         if "error" in clan_data:
+            clan_data.setdefault("guild_id", str(clan_id))
+            clan_data.setdefault("logo_url", guild_lookup.guild_logo_url(clan_id))
             return web.json_response(clan_data, status=500)
 
+        clan_data.setdefault("logo_url", guild_lookup.guild_logo_url(clan_id))
+        clan_data.setdefault("member_count", clan_data.get("current_members", 0))
         current_xp = int(clan_data.get("Total guild xp") or clan_data.get("xp") or 0)
         baseline_xp = get_persisted_baseline_xp(clan_id, current_xp)
         gained_exp = current_xp - baseline_xp
@@ -851,11 +1129,12 @@ async def handle_api_guild_info(request: web.Request) -> web.Response:
             "clan_basic_info": clan_data
         }
 
-        return web.json_response({  
-            "status": "success",  
-            "requested_region": region,  
-            "queried_clan_id": clan_id,  
-            "api_response": api_response_body  
+        return web.json_response({
+            "status": "success",
+            "requested_region": region,
+            "queried_clan_id": clan_id,
+            "guild": clan_data,
+            "api_response": api_response_body
         }, status=200)
 
     except Exception as e:
@@ -1169,6 +1448,11 @@ async def start_web_dashboard(host: str = "127.0.0.1", port: int = 5000):
     app.router.add_get("/", handle_index)
     app.router.add_post("/api/clanjoin", handle_api_clan_join)
     app.router.add_get("/api/guildinfo", handle_api_guild_info)
+    app.router.add_get("/api/guild/config", handle_get_guild_config)
+    app.router.add_post("/api/guild/config", handle_save_guild_config)
+    app.router.add_get("/api/guild/badge/{guild_id}", handle_guild_badge)
+    app.router.add_post("/api/accounts/generate", handle_generate_accounts)
+    app.router.add_get("/api/accounts/generate/status", handle_generate_status)
     app.router.add_get("/api/stats", handle_get_stats)
     app.router.add_get("/api/logs", handle_api_logs)
     app.router.add_post("/api/account/add", handle_add_account)

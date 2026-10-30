@@ -413,6 +413,42 @@ def remove_account(uid: Optional[str] = None, token: Optional[str] = None) -> in
     return cur.rowcount
 
 
+# ─────────────────────────── key/value settings ───────────────────────────
+
+def kv_get(key: str, default: Any = None) -> Any:
+    """Read a JSON value from the settings table."""
+    with _lock:
+        row = _connection().execute(
+            "SELECT value FROM kv WHERE key = ?", (str(key),)
+        ).fetchone()
+    if row is None:
+        return default
+    try:
+        return _loads(row["value"])
+    except (TypeError, ValueError):
+        return row["value"]
+
+
+def kv_set(key: str, value: Any) -> None:
+    """Persist a JSON value in the settings table."""
+    with _lock:
+        conn = _connection()
+        with conn:
+            conn.execute(
+                "INSERT INTO kv (key, value, updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                (str(key), _dumps(value), time.time()),
+            )
+
+
+def kv_delete(key: str) -> int:
+    with _lock:
+        conn = _connection()
+        with conn:
+            cur = conn.execute("DELETE FROM kv WHERE key = ?", (str(key),))
+    return cur.rowcount
+
+
 # ─────────────────────────── devices ───────────────────────────
 
 def devices_all() -> Dict[str, dict]:

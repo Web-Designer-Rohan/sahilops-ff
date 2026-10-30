@@ -33,10 +33,11 @@ os.environ["SAHILOPS_DB"] = os.path.join(WORK_DIR, "smoke.db")
 
 import httpx
 
-from core import health, notifications, storage
+from core import data_pb2, health, notifications, storage
 from core import proxy as proxy_support
 from core import thunderFF_pb2
 from core.app import BR_HEX, _squad_target_size, _start_worker, apply_region_override
+from dashboard import dashboard_server as dashboard_module
 from dashboard.dashboard_server import (
     API_KEY,
     bot_state,
@@ -44,6 +45,7 @@ from dashboard.dashboard_server import (
     redact_text,
     start_web_dashboard,
 )
+from utils import guild_lookup
 
 CHECKS = []
 
@@ -381,6 +383,115 @@ def test_redaction_helpers():
           redact_text("token=abc123 password=hunter2 ok"))
 
 
+def test_guild_lookup_parser():
+    resp = data_pb2.response()
+    resp.guild_details.clan_id = 3055517625
+    resp.guild_details.name = "SahilOps Elite"
+    resp.guild_details.level = 7
+    resp.guild_details.total_members = 42
+    resp.guild_details.members_online = 11
+    resp.guild_details.region = "IND"
+    resp.guild_details.leader_uid = 123456
+    resp.xp = 987654
+
+    meta = guild_lookup.parse_guild_metadata(
+        resp.SerializeToString(), 3055517625, "IN")
+    check("guild: parser reads name/level/members",
+          meta["name"] == "SahilOps Elite" and meta["level"] == 7
+          and meta["member_count"] == 42 and meta["members_online"] == 11,
+          str(meta))
+    check("guild: parser normalizes IN to IND and keeps xp",
+          meta["region"] == "IND" and meta["xp"] == 987654, str(meta))
+    check("guild: logo url points at the badge route",
+          meta["logo_url"] == "/api/guild/badge/3055517625.svg", meta["logo_url"])
+    check("guild: region aliases normalize",
+          guild_lookup.normalize_region("in") == "IND"
+          and guild_lookup.normalize_region("nope") == "IND")
+
+    svg = guild_lookup.guild_badge_svg(3055517625, "SahilOps Elite", 7, 42)
+    check("guild: badge svg carries level/member/initials",
+          svg.startswith("<svg") and "LV 7" in svg and "42 MEM" in svg
+          and ">SE<" in svg, svg[:120])
+
+    try:
+        guild_lookup.parse_guild_metadata(b"\x0a\xff", 1)
+        raised = False
+    except guild_lookup.GuildLookupError:
+        raised = True
+    check("guild: malformed protobuf rejected", raised)
+
+
+def test_rate_limit_retry():
+    from utils import SaMIGEN
+
+    class FakeResponse:
+        def __init__(self, status_code):
+            self.status_code = status_code
+            self.headers = {}
+            self.text = ""
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, method, url, **kwargs):
+            self.calls += 1
+            return FakeResponse(429 if self.calls == 1 else 200)
+
+    original_base = SaMIGEN.RATE_LIMIT_BASE_DELAY
+    original_max = SaMIGEN.RATE_LIMIT_MAX_DELAY
+    original_gap = SaMIGEN.REQUEST_GAP
+    SaMIGEN.RATE_LIMIT_BASE_DELAY = 0.01
+    SaMIGEN.RATE_LIMIT_MAX_DELAY = 0.01
+    SaMIGEN.REQUEST_GAP = 0.0
+    session = FakeSession()
+    try:
+        before = SaMIGEN.rate_limit_hits()
+        response = SaMIGEN.request_with_retry(
+            session, "POST", "https://example.test")
+        after = SaMIGEN.rate_limit_hits()
+    finally:
+        SaMIGEN.RATE_LIMIT_BASE_DELAY = original_base
+        SaMIGEN.RATE_LIMIT_MAX_DELAY = original_max
+        SaMIGEN.REQUEST_GAP = original_gap
+
+    check("generator: 429 retry returns the recovered response",
+          response.status_code == 200 and session.calls == 2,
+          f"calls={session.calls}")
+    check("generator: 429 hit counter increments",
+          after == before + 1, f"{before}->{after}")
+
+
+def test_sequential_generator():
+    from utils import SaMIGEN
+
+    calls = []
+    original = SaMIGEN.create_one_account
+
+    def fake_create(worker_id, total, counters, region="IND",
+                    region_label=None, single_attempt=False):
+        calls.append((worker_id, region, region_label, single_attempt))
+        counters["success"] += 1
+        return True
+
+    SaMIGEN.create_one_account = fake_create
+    try:
+        started = time.time()
+        counters = SaMIGEN.generate_accounts(
+            2, region="IND", region_label="IN", delay=1.0)
+        elapsed = time.time() - started
+    finally:
+        SaMIGEN.create_one_account = original
+
+    check("generator: sequential runner creates one account per slot",
+          counters.get("success") == 2 and counters.get("failed") == 0,
+          str(counters))
+    check("generator: runner passes region and single-attempt mode",
+          calls == [(1, "IND", "IN", True), (2, "IND", "IN", True)], str(calls))
+    check("generator: runner paces between accounts",
+          elapsed >= 0.95, f"{elapsed:.2f}s")
+
+
 def test_region_override():
     packet = bytes.fromhex(BR_HEX)
     for region in ("ID", "SG", "IND"):
@@ -427,7 +538,8 @@ async def test_dashboard(port):
         async with httpx.AsyncClient(base_url=base, timeout=5.0) as anon:
             for path in ("/api/account/add", "/api/account/delete", "/api/account/refresh",
                          "/api/account/restart", "/api/account/pause",
-                         "/api/account/pause_all", "/api/logs/clear", "/api/clanjoin"):
+                         "/api/account/pause_all", "/api/logs/clear", "/api/clanjoin",
+                         "/api/accounts/generate", "/api/guild/config"):
                 res = await anon.post(path, json={"uid": "nope"})
                 check(f"security: {path} rejects requests without X-API-Key",
                       res.status_code == 401, str(res.status_code))
@@ -438,6 +550,10 @@ async def test_dashboard(port):
                   all(a.get("uid") != "nope" for a in storage.list_accounts()))
             res = await anon.get("/api/guildinfo", params={"guild_id": "1"})
             check("security: /api/guildinfo requires the key", res.status_code == 401, str(res.status_code))
+            res = await anon.get("/api/guild/config")
+            check("security: /api/guild/config requires the key", res.status_code == 401, str(res.status_code))
+            res = await anon.get("/api/accounts/generate/status")
+            check("security: generator status requires the key", res.status_code == 401, str(res.status_code))
 
         async with httpx.AsyncClient(base_url=base, timeout=5.0, headers=auth) as client:
             res = await client.get("/")
@@ -512,6 +628,92 @@ async def test_dashboard(port):
                   res.status_code == 200 and any("smoke-test log line" in line for line in res.json()["logs"]),
                   str(res.text[:200]))
 
+            # ── target guild configuration ───────────────────────────────
+            res = await client.get("/api/guild/config")
+            check("guild: config starts empty",
+                  res.status_code == 200 and res.json().get("guild_id") == "", res.text)
+
+            res = await client.post("/api/guild/config",
+                                    json={"guild_id": "3055517625", "region": "IN"})
+            body = res.json()
+            check("guild: config saves guild id and normalizes region",
+                  res.status_code == 200 and body.get("guild_id") == "3055517625"
+                  and body.get("region") == "IND", res.text)
+            check("guild: config persisted in SQLite kv",
+                  storage.kv_get("guild_config") == {"guild_id": "3055517625", "region": "IND"},
+                  str(storage.kv_get("guild_config")))
+            res = await client.get("/api/guild/config")
+            check("guild: config reloads after save",
+                  res.json().get("guild_id") == "3055517625"
+                  and res.json().get("logo_url") == "/api/guild/badge/3055517625.svg",
+                  res.text)
+            res = await client.post("/api/guild/config", json={"guild_id": "not-a-number"})
+            check("guild: non-numeric guild id rejected", res.status_code == 400, str(res.status_code))
+            res = await client.post("/api/guild/config", json={"guild_id": "1", "region": "XX"})
+            check("guild: unsupported region rejected", res.status_code == 400, str(res.status_code))
+
+            res = await client.get("/api/guild/badge/3055517625.svg",
+                                   params={"name": "SahilOps Elite", "level": 7, "members": 42})
+            check("guild: badge endpoint returns SVG",
+                  res.status_code == 200
+                  and res.headers["Content-Type"].startswith("image/svg+xml")
+                  and "LV 7" in res.text and "42 MEM" in res.text, res.text[:120])
+            res = await client.get("/api/guild/badge/not-a-number.svg")
+            check("guild: badge rejects invalid ids", res.status_code == 404, str(res.status_code))
+
+            storage.token_set("guild-token", {"token": "fake-token"})
+            original_lookup = dashboard_module.guild_lookup.fetch_guild_metadata
+
+            def fake_lookup(guild_id, region="IND", token_cache=None,
+                            timeout=12.0, session=None):
+                return {
+                    "guild_id": int(guild_id),
+                    "clan_id": int(guild_id),
+                    "name": "SahilOps Elite",
+                    "clan_name": "SahilOps Elite",
+                    "level": 7,
+                    "clan_level": 7,
+                    "member_count": 42,
+                    "current_members": 42,
+                    "members_online": 11,
+                    "max_members": 50,
+                    "region": region,
+                    "leader_uid": 123456,
+                    "xp": 987654,
+                    "Total guild xp": 987654,
+                    "logo_url": guild_lookup.guild_logo_url(guild_id),
+                    "source": "garena",
+                }
+
+            dashboard_module.guild_lookup.fetch_guild_metadata = fake_lookup
+            try:
+                res = await client.get("/api/guildinfo")
+                body = res.json()
+                guild = body.get("guild") or {}
+                check("guild: /api/guildinfo uses the saved target",
+                      res.status_code == 200 and body.get("queried_clan_id") == "3055517625",
+                      res.text[:300])
+                check("guild: metadata includes name/level/members/logo",
+                      guild.get("name") == "SahilOps Elite" and guild.get("level") == 7
+                      and guild.get("member_count") == 42
+                      and guild.get("logo_url") == "/api/guild/badge/3055517625.svg",
+                      str(guild)[:400])
+                check("guild: legacy api_response stays compatible",
+                      body.get("api_response", {}).get("clan_basic_info", {})
+                      .get("current_members") == 42, res.text[:300])
+                check("guild: xp baseline exposed for the tracker",
+                      "old_xp" in guild and "gained_exp" in guild, str(guild)[:300])
+            finally:
+                dashboard_module.guild_lookup.fetch_guild_metadata = original_lookup
+                storage.token_delete("guild-token")
+
+            res = await client.post("/api/guild/config",
+                                    json={"guild_id": "", "region": "IND"})
+            check("guild: config can be cleared",
+                  res.status_code == 200 and res.json().get("guild_id") == ""
+                  and storage.kv_get("guild_config", {}).get("guild_id") == "",
+                  res.text)
+
             res = await client.post("/api/account/add", json={"uid": "smoke-uid", "password": "smoke-pw"})
             check("dashboard: add account accepted", res.status_code == 200 and res.json().get("status") == "ok",
                   res.text)
@@ -561,6 +763,86 @@ async def test_dashboard(port):
             check("dashboard: 10 add/pause/restart/delete cycles complete without deadlock",
                   elapsed < 15.0, f"{elapsed:.1f}s")
 
+            # ── web guest generator ──────────────────────────────────────
+            res = await client.post("/api/accounts/generate", json={"count": 0})
+            check("generator: count below 1 rejected", res.status_code == 400, res.text)
+            res = await client.post("/api/accounts/generate", json={"count": 11})
+            check("generator: count above 10 rejected", res.status_code == 400, res.text)
+            res = await client.post("/api/accounts/generate", json={"count": "many"})
+            check("generator: non-numeric count rejected", res.status_code == 400, res.text)
+            res = await client.post("/api/accounts/generate",
+                                    json={"count": 1, "region": "ZZ"})
+            check("generator: unsupported region rejected", res.status_code == 400, res.text)
+
+            original_generation = dashboard_module._generate_accounts_sync
+            generation_gate = threading.Event()
+            generation_calls = []
+            generated_uids = []
+
+            def fake_generation(count, region_code, region_label, delay):
+                generation_calls.append((count, region_code, region_label, delay))
+                generation_gate.wait(timeout=10)
+                for i in range(count):
+                    uid = f"generated-{i}"
+                    storage.upsert_account({"uid": uid, "password": "pw",
+                                            "region": region_label})
+                    generated_uids.append(uid)
+                return {"success": count, "failed": 0, "rate_limited": 0}
+
+            dashboard_module._generate_accounts_sync = fake_generation
+            try:
+                res = await client.post("/api/accounts/generate",
+                                        json={"count": 2, "region": "IN", "delay": 0.1})
+                body = res.json()
+                check("generator: starts a sequential job",
+                      res.status_code == 202 and body.get("status") == "started", res.text)
+                check("generator: pacing clamped to the 2s floor",
+                      body.get("delay") == 2.0, str(body.get("delay")))
+                job_id = body.get("job_id")
+
+                res = await client.post("/api/accounts/generate", json={"count": 1})
+                check("generator: concurrent job rejected with 409",
+                      res.status_code == 409 and res.json().get("job_id") == job_id, res.text)
+                res = await client.get("/api/accounts/generate/status")
+                check("generator: status reports running",
+                      res.status_code == 200 and res.json().get("status") == "running"
+                      and res.json().get("job_id") == job_id, res.text[:300])
+
+                generation_gate.set()
+                terminal = await _wait_for(
+                    lambda: dashboard_module.GENERATION_JOB.get("status")
+                    in ("completed", "failed"), timeout=10.0)
+                check("generator: job reaches a terminal state", terminal,
+                      str(dashboard_module.GENERATION_JOB.get("status")))
+
+                res = await client.get("/api/accounts/generate/status")
+                state = res.json()
+                check("generator: completed job reports created accounts",
+                      state.get("status") == "completed"
+                      and len(state.get("created") or []) == 2, str(state)[:400])
+                check("generator: generated accounts persisted to SQLite",
+                      {"generated-0", "generated-1"}
+                      <= {a.get("uid") for a in storage.list_accounts()})
+                check("generator: sequential pacing passed to the worker",
+                      generation_calls == [(2, "IND", "IN", 2.0)],
+                      str(generation_calls))
+
+                try:
+                    await asyncio.wait_for(_wait_for(
+                        lambda: any(str(entry.get("uid", "")).startswith("generated-")
+                                    for entry in calls["added"])), timeout=3.0)
+                except asyncio.TimeoutError:
+                    pass
+                check("generator: on_account_added ran for generated accounts",
+                      any(str(entry.get("uid", "")).startswith("generated-")
+                          for entry in calls["added"]), str(calls["added"])[-300:])
+            finally:
+                generation_gate.set()
+                dashboard_module._generate_accounts_sync = original_generation
+                for uid in generated_uids:
+                    storage.remove_account(uid=uid)
+                dashboard_module.GENERATION_JOB["status"] = "idle"
+
             await asyncio.sleep(0.3)
             await bot_state.drain(timeout=5.0)
             check("dashboard: background tasks drained on shutdown",
@@ -591,6 +873,9 @@ def main():
     test_storage_health()
     test_squad_sizing()
     test_redaction_helpers()
+    test_guild_lookup_parser()
+    test_rate_limit_retry()
+    test_sequential_generator()
     test_region_override()
     test_health_detection()
     test_proxy_helpers()

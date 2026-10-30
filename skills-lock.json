@@ -67,6 +67,12 @@
       "skillPath": "skills/ponytail-review/SKILL.md",
       "computedHash": "800dc0c86402978e12359f701b9e0c81ba4607a0cd0027f4596d0f835a67eadc"
     },
+    "process-automation-audit": {
+      "source": "namtanmk/claude-skills-ultimate-bundle",
+      "sourceType": "github",
+      "skillPath": "Operations & Systems/process-automation-audit/SKILL.md",
+      "computedHash": "9fba2bd9ea1ea9ee470ea5cbe907a3b65d06603ca49267a800d02e37ed9c0577"
+    },
     "python-anti-patterns": {
       "source": "wshobson/agents",
       "sourceType": "github",

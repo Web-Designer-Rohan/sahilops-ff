@@ -34,7 +34,8 @@ from core.health import (
     is_quarantine_status,
 )
 
-from dashboard.dashboard_server import bot_state, start_web_dashboard
+from dashboard.dashboard_server import (bot_state, start_web_dashboard,
+    handle_generate_accounts, handle_generate_status)
 
 # ═══════════════════════════ CONFIG ═══════════════════════════
 WEB_HOST = os.environ.get("SAHILOPS_HOST", "127.0.0.1")

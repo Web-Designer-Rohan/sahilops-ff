@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="sahilops-api-key" content="__SAHILOPS_API_KEY__">
+    <link rel="icon" href="data:,">
     <title>SahilOps Dashboard</title>
     <style>
         :root {
@@ -37,6 +38,7 @@
             align-items: center;
             min-height: 100vh;
             padding: 20px;
+            overflow-x: hidden;
         }
 
         /* Top Navigation Header matching user style */
@@ -71,13 +73,17 @@
             background: rgba(56, 189, 248, 0.1);
             border: 1px solid rgba(56, 189, 248, 0.3);
             color: var(--accent-cyan);
-            padding: 6px 12px;
-            border-radius: 8px;
+            padding: 8px 12px;
+            min-height: 44px;
+            border-radius: 10px;
             font-size: 11px;
             font-weight: 700;
             cursor: pointer;
             transition: all 0.2s ease;
             white-space: nowrap;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
         }
 
         .top-btn:hover {
@@ -144,8 +150,9 @@
             background: rgba(239, 68, 68, 0.1);
             border: 1px solid rgba(239, 68, 68, 0.3);
             color: #ef4444;
-            padding: 4px 10px;
-            border-radius: 6px;
+            padding: 8px 12px;
+            min-height: 44px;
+            border-radius: 8px;
             font-size: 11px;
             font-weight: 600;
             cursor: pointer;
@@ -227,9 +234,24 @@
             letter-spacing: 0.3px;
         }
 
+        .guild-meta {
+            min-width: 0;
+            flex: 1;
+        }
+
+        .guild-meta h3 {
+            font-size: 20px;
+            font-weight: 700;
+            color: #fff;
+            margin-bottom: 6px;
+            letter-spacing: 0.3px;
+            overflow-wrap: anywhere;
+        }
+
         .guild-meta-tags {
             display: flex;
             align-items: center;
+            flex-wrap: wrap;
             gap: 8px;
             font-size: 12px;
             color: var(--text-sub);
@@ -321,6 +343,7 @@
 
         .action-btn {
             width: 100%;
+            min-height: 48px;
             background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
             color: #030712;
             border: none;
@@ -335,6 +358,13 @@
             gap: 8px;
             box-shadow: 0 8px 20px -4px rgba(56, 189, 248, 0.4);
             transition: all 0.2s ease;
+        }
+
+        .action-btn:disabled {
+            opacity: 0.55;
+            cursor: wait;
+            transform: none;
+            box-shadow: none;
         }
 
         .action-btn:hover {
@@ -419,6 +449,7 @@
 
         .form-input {
             width: 100%;
+            min-height: 44px;
             background: #030712;
             border: 1px solid rgba(255, 255, 255, 0.1);
             border-radius: 10px;
@@ -428,6 +459,40 @@
             outline: none;
             transition: border-color 0.2s;
         }
+
+        select.form-input {
+            appearance: none;
+            background-image: linear-gradient(45deg, transparent 50%, var(--accent-cyan) 50%),
+                              linear-gradient(135deg, var(--accent-cyan) 50%, transparent 50%);
+            background-position: calc(100% - 18px) 20px, calc(100% - 13px) 20px;
+            background-size: 5px 5px, 5px 5px;
+            background-repeat: no-repeat;
+            padding-right: 34px;
+        }
+
+        .field-row {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .field-row .form-group {
+            flex: 1 1 140px;
+            min-width: 0;
+        }
+
+        .inline-status {
+            min-height: 20px;
+            margin-top: 12px;
+            font-size: 12px;
+            line-height: 1.5;
+            color: var(--text-sub);
+            overflow-wrap: anywhere;
+        }
+
+        .inline-status.success { color: var(--success-glow); }
+        .inline-status.warning { color: var(--gold); }
+        .inline-status.error { color: #f87171; }
 
         .form-input:focus {
             border-color: var(--accent-cyan);
@@ -441,6 +506,7 @@
 
         .modal-btn {
             flex: 1;
+            min-height: 44px;
             padding: 12px;
             border-radius: 10px;
             font-weight: 700;
@@ -530,6 +596,19 @@
             border: 1px solid rgba(251, 191, 36, 0.35);
             color: var(--gold);
         }
+
+        @media (max-width: 420px) {
+            body { padding: 12px; }
+            .top-navbar { padding: 10px 12px; margin-bottom: 14px; }
+            .nav-title { font-size: 13px; }
+            .nav-actions { gap: 6px; }
+            .top-btn { padding: 8px 9px; font-size: 10px; }
+            .dashboard-container { gap: 14px; }
+            .premium-card { padding: 18px; border-radius: 18px; }
+            .guild-profile-row { gap: 12px; }
+            .guild-avatar { width: 60px; height: 60px; border-radius: 14px; }
+            .guild-meta h3 { font-size: 18px; }
+        }
     </style>
 </head>
 <body>
@@ -554,13 +633,14 @@
             </div>
 
             <div class="guild-profile-row">
-                <img src="https://raw.githubusercontent.com/ronobiswas874-sketch/Images/refs/heads/main/1792063565823.png" alt="Logo" class="guild-avatar" onerror="this.src='https://via.placeholder.com/64/0f172a/38bdf8?text=G';">
+                <img id="guild-avatar" src="/api/guild/badge/0.svg?name=FF" alt="Guild badge" class="guild-avatar" onerror="this.onerror=null;this.src='/api/guild/badge/0.svg?name=FF';">
                 <div class="guild-meta">
-                    <h3 id="info-clan-name">N/H</h3>
+                    <h3 id="info-clan-name">Not configured</h3>
                     <div class="guild-meta-tags">
-                        <span>ID:<span id="info-clan-id">3055517625</span></span>
+                        <span>ID:<span id="info-clan-id">—</span></span>
                         <span class="tag-region" id="info-clan-region">IND</span>
-                        <span class="tag-lvl">LV.<span id="info-clan-level">0</span></span>
+                        <span class="tag-lvl">LV.<span id="info-clan-level">—</span></span>
+                        <span>MEM:<span id="info-clan-members">—</span></span>
                     </div>
                 </div>
             </div>
@@ -594,6 +674,81 @@
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.73-5.73"/></svg>
                 Refresh Data
             </button>
+        </div>
+
+        <!-- Target Guild Configuration Card -->
+        <div class="premium-card" id="guild-config-card">
+            <div class="card-header-flex">
+                <span class="card-title">Target Guild Configuration</span>
+                <div class="live-pill" id="guild-config-state">NOT SET</div>
+            </div>
+            <div class="form-group">
+                <label for="guildIdInput">Guild ID</label>
+                <input type="text" id="guildIdInput" class="form-input" inputmode="numeric"
+                       pattern="[0-9]*" maxlength="20" autocomplete="off"
+                       placeholder="e.g. 3055517625">
+            </div>
+            <div class="field-row">
+                <div class="form-group">
+                    <label for="guildRegionInput">Region</label>
+                    <select id="guildRegionInput" class="form-input">
+                        <option value="IND">India [IN]</option>
+                        <option value="ID">Indonesia [ID]</option>
+                        <option value="SG">Singapore [SG]</option>
+                        <option value="TH">Thailand [TH]</option>
+                        <option value="MY">Malaysia [MY]</option>
+                        <option value="VN">Vietnam [VN]</option>
+                        <option value="PH">Philippines [PH]</option>
+                        <option value="BR">Brazil [BR]</option>
+                        <option value="PK">Pakistan [PK]</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Storage</label>
+                    <input type="text" class="form-input" value="sahilops.db" disabled aria-label="Storage database">
+                </div>
+            </div>
+            <button id="saveGuildBtn" class="action-btn" onclick="saveGuildConfig()">
+                Save Guild Target
+            </button>
+            <div id="guild-config-msg" class="inline-status" role="status" aria-live="polite">
+                Guild metadata is fetched with a cached game token.
+            </div>
+        </div>
+
+        <!-- Guest Account Generator Card -->
+        <div class="premium-card" id="generator-card">
+            <div class="card-header-flex">
+                <span class="card-title">Guest Account Generator</span>
+                <div class="live-pill" id="generator-state">READY</div>
+            </div>
+            <div class="field-row">
+                <div class="form-group">
+                    <label for="generatorRegionInput">Region</label>
+                    <select id="generatorRegionInput" class="form-input">
+                        <option value="IN">India [IN]</option>
+                        <option value="ID">Indonesia [ID]</option>
+                        <option value="SG">Singapore [SG]</option>
+                        <option value="TH">Thailand [TH]</option>
+                        <option value="MY">Malaysia [MY]</option>
+                        <option value="VN">Vietnam [VN]</option>
+                        <option value="PH">Philippines [PH]</option>
+                        <option value="BR">Brazil [BR]</option>
+                        <option value="PK">Pakistan [PK]</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="generatorCountInput">Accounts</label>
+                    <input type="number" id="generatorCountInput" class="form-input"
+                           min="1" max="10" step="1" value="1" inputmode="numeric">
+                </div>
+            </div>
+            <button id="generateGuestBtn" class="action-btn" onclick="generateGuestAccount()">
+                Generate Guest Account
+            </button>
+            <div id="generator-msg" class="inline-status" role="status" aria-live="polite">
+                Sequential generation · built-in 429 backoff.
+            </div>
         </div>
 
         <!-- Account Health Card -->
@@ -651,11 +806,11 @@
     </div>
 
     <script>
-        const DEFAULT_CLAN_ID = "3055517625";
-        const DEFAULT_REGION = "IND";
         const API_KEY = document.querySelector('meta[name="sahilops-api-key"]').content;
         let autoRefreshTimer = null;
+        let generationPollTimer = null;
         let isAllPaused = false;
+        let guildConfig = { guild_id: "", region: "IND" };
 
         // Every write route requires the control-panel key in X-API-Key.
         function apiHeaders() {
@@ -669,36 +824,235 @@
             return `${String(hours).padStart(2, '0')}h ${String(minutes).padStart(2, '0')}m ${String(seconds).padStart(2, '0')}s`;
         }
 
-        async function fetchGuildInfo() {
+        function setInlineStatus(id, text, kind = "") {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.textContent = text;
+            el.className = `inline-status ${kind}`.trim();
+        }
+
+        function setGeneratorPill(text) {
+            const pill = document.getElementById('generator-state');
+            if (pill) pill.textContent = text;
+        }
+
+        function badgeUrl(guildId, name = "", level = 0, members = 0) {
+            const params = new URLSearchParams({
+                name: name || "",
+                level: String(level || 0),
+                members: String(members || 0)
+            });
+            return `/api/guild/badge/${encodeURIComponent(guildId)}.svg?${params.toString()}`;
+        }
+
+        function updateGuildBadge(guildId, name = "", level = 0, members = 0) {
+            const img = document.getElementById('guild-avatar');
+            if (img) img.src = badgeUrl(guildId || 0, name, level, members);
+        }
+
+        async function loadGuildConfig() {
             try {
-                const guildRes = await fetch(`/api/guildinfo?guild_id=${DEFAULT_CLAN_ID}&region=${DEFAULT_REGION}`, {
+                const res = await fetch('/api/guild/config', {
                     method: 'GET',
                     headers: apiHeaders()
                 });
-                
-                if (!guildRes.ok) return;
-
-                const responseJson = await guildRes.json();
-                const guildData = responseJson.api_response ? responseJson.api_response.clan_basic_info : responseJson;
-                
-                if (guildData) {
-                    const currentXp = Number(guildData['Total guild xp'] || guildData['xp'] || 0);
-                    const baselineXp = Number(guildData.old_xp || currentXp);
-                    const gainedXp = Number(guildData.gained_exp || 0);
-                    const clanLevel = guildData.clan_level || '1';
-
-                    document.getElementById('info-clan-name').textContent = guildData.clan_name || 'N/H';
-                    document.getElementById('info-clan-id').textContent = guildData.clan_id || DEFAULT_CLAN_ID;
-                    document.getElementById('info-clan-region').textContent = guildData.region || DEFAULT_REGION;
-                    document.getElementById('info-clan-level').textContent = clanLevel;
-                    
-                    document.getElementById('info-clan-xp-old').textContent = baselineXp.toLocaleString();
-                    document.getElementById('info-clan-xp-live').textContent = currentXp.toLocaleString();
-                    document.getElementById('info-clan-xp-gained').textContent = (gainedXp >= 0 ? `+${gainedXp}` : gainedXp).toLocaleString();
+                if (!res.ok) return;
+                const data = await res.json();
+                guildConfig = {
+                    guild_id: String(data.guild_id || ""),
+                    region: String(data.region || "IND")
+                };
+                document.getElementById('guildIdInput').value = guildConfig.guild_id;
+                document.getElementById('guildRegionInput').value = guildConfig.region;
+                const state = document.getElementById('guild-config-state');
+                state.textContent = guildConfig.guild_id ? 'SAVED' : 'NOT SET';
+                if (guildConfig.guild_id) {
+                    setInlineStatus('guild-config-msg', 'Target loaded from sahilops.db.');
+                    updateGuildBadge(guildConfig.guild_id);
                 }
             } catch (err) {
-                console.error('Error fetching guild info:', err);
+                setInlineStatus('guild-config-msg', 'Could not load saved guild target.', 'warning');
             }
+        }
+
+        async function saveGuildConfig() {
+            const guildId = document.getElementById('guildIdInput').value.trim();
+            const region = document.getElementById('guildRegionInput').value;
+            if (guildId && !/^\d{1,20}$/.test(guildId)) {
+                setInlineStatus('guild-config-msg', 'Guild ID must contain digits only.', 'error');
+                return;
+            }
+
+            const btn = document.getElementById('saveGuildBtn');
+            btn.disabled = true;
+            btn.textContent = 'Saving...';
+            try {
+                const res = await fetch('/api/guild/config', {
+                    method: 'POST',
+                    headers: apiHeaders(),
+                    body: JSON.stringify({ guild_id: guildId, region })
+                });
+                const data = await res.json();
+                if (!res.ok || data.status !== 'ok') {
+                    throw new Error(data.error || 'Save failed');
+                }
+                guildConfig = { guild_id: String(data.guild_id || ""), region: data.region || region };
+                document.getElementById('guild-config-state').textContent = guildConfig.guild_id ? 'SAVED' : 'NOT SET';
+                updateGuildBadge(guildConfig.guild_id);
+                setInlineStatus('guild-config-msg',
+                    guildConfig.guild_id ? 'Guild target saved to sahilops.db.' : 'Guild target cleared.',
+                    'success');
+                if (guildConfig.guild_id) await fetchGuildInfo();
+            } catch (err) {
+                setInlineStatus('guild-config-msg', `Save failed: ${err.message}`, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Save Guild Target';
+            }
+        }
+
+        async function fetchGuildInfo() {
+            const guildId = guildConfig.guild_id || document.getElementById('guildIdInput').value.trim();
+            if (!guildId) {
+                document.getElementById('info-clan-name').textContent = 'Not configured';
+                document.getElementById('info-clan-id').textContent = '—';
+                document.getElementById('info-clan-level').textContent = '—';
+                document.getElementById('info-clan-members').textContent = '—';
+                updateGuildBadge(0);
+                return;
+            }
+
+            try {
+                const guildRes = await fetch(
+                    `/api/guildinfo?guild_id=${encodeURIComponent(guildId)}&region=${encodeURIComponent(guildConfig.region || 'IND')}`,
+                    { method: 'GET', headers: apiHeaders() }
+                );
+                const responseJson = await guildRes.json().catch(() => ({}));
+                if (!guildRes.ok) {
+                    updateGuildBadge(guildId);
+                    setInlineStatus('guild-config-msg',
+                        responseJson.error || 'Guild metadata unavailable — target saved, badge shown.',
+                        'warning');
+                    return;
+                }
+
+                const guildData = responseJson.api_response
+                    ? responseJson.api_response.clan_basic_info
+                    : (responseJson.guild || responseJson);
+                if (!guildData) return;
+
+                const currentXp = Number(guildData['Total guild xp'] || guildData['xp'] || 0);
+                const baselineXp = Number(guildData.old_xp || currentXp);
+                const gainedXp = Number(guildData.gained_exp || 0);
+                const clanLevel = guildData.level || guildData.clan_level || '—';
+                const memberCount = guildData.member_count ?? guildData.current_members ?? '—';
+                const clanName = guildData.name || guildData.clan_name || 'Guild';
+
+                document.getElementById('info-clan-name').textContent = clanName;
+                document.getElementById('info-clan-id').textContent = guildData.guild_id || guildData.clan_id || guildId;
+                document.getElementById('info-clan-region').textContent = guildData.region || guildConfig.region || 'IND';
+                document.getElementById('info-clan-level').textContent = clanLevel;
+                document.getElementById('info-clan-members').textContent = memberCount;
+                updateGuildBadge(guildId, clanName, clanLevel, memberCount);
+
+                document.getElementById('info-clan-xp-old').textContent = baselineXp.toLocaleString();
+                document.getElementById('info-clan-xp-live').textContent = currentXp.toLocaleString();
+                document.getElementById('info-clan-xp-gained').textContent = (gainedXp >= 0 ? `+${gainedXp}` : gainedXp).toLocaleString();
+                setInlineStatus('guild-config-msg', 'Live guild metadata loaded.', 'success');
+            } catch (err) {
+                updateGuildBadge(guildId);
+                setInlineStatus('guild-config-msg', 'Guild metadata request failed.', 'warning');
+            }
+        }
+
+        async function generateGuestAccount() {
+            const btn = document.getElementById('generateGuestBtn');
+            const count = Number(document.getElementById('generatorCountInput').value);
+            const region = document.getElementById('generatorRegionInput').value;
+            if (!Number.isInteger(count) || count < 1 || count > 10) {
+                setInlineStatus('generator-msg', 'Accounts must be a whole number from 1 to 10.', 'error');
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = 'Generating...';
+            setGeneratorPill('RUNNING');
+            setInlineStatus('generator-msg', 'Starting sequential generation…');
+            try {
+                const res = await fetch('/api/accounts/generate', {
+                    method: 'POST',
+                    headers: apiHeaders(),
+                    body: JSON.stringify({ count, region })
+                });
+                const data = await res.json();
+                if (res.status === 409) {
+                    setInlineStatus('generator-msg', data.error || 'A generation job is already running.', 'warning');
+                    if (data.job_id) {
+                        pollGenerationStatus(data.job_id);
+                    } else {
+                        finishGeneration();
+                    }
+                    return;
+                }
+                if (!res.ok || data.status !== 'started') {
+                    throw new Error(data.error || 'Could not start generation');
+                }
+                setInlineStatus('generator-msg', `Job ${data.job_id} running · ${data.region_label} · ${data.delay}s pacing.`);
+                pollGenerationStatus(data.job_id);
+            } catch (err) {
+                setInlineStatus('generator-msg', `Generation failed: ${err.message}`, 'error');
+                setGeneratorPill('READY');
+                finishGeneration();
+            }
+        }
+
+        function finishGeneration() {
+            const btn = document.getElementById('generateGuestBtn');
+            btn.disabled = false;
+            btn.textContent = 'Generate Guest Account';
+        }
+
+        function pollGenerationStatus(jobId) {
+            if (generationPollTimer) clearTimeout(generationPollTimer);
+            const poll = async () => {
+                try {
+                    const res = await fetch(
+                        `/api/accounts/generate/status?job_id=${encodeURIComponent(jobId)}`,
+                        { method: 'GET', headers: apiHeaders() }
+                    );
+                    const data = await res.json();
+                    if (!res.ok) throw new Error(data.error || 'Status unavailable');
+
+                    if (data.status === 'running') {
+                        setInlineStatus('generator-msg',
+                            `Running: ${data.success || 0}/${data.count || 0} created · 429-safe pacing active.`);
+                        generationPollTimer = setTimeout(poll, 1500);
+                        return;
+                    }
+
+                    finishGeneration();
+                    if (data.status === 'completed') {
+                        const made = Array.isArray(data.created) ? data.created.length : 0;
+                        setGeneratorPill(made ? 'DONE' : 'NO ACCOUNT');
+                        setInlineStatus('generator-msg',
+                            made ? `Generated ${made}/${data.count || made} account(s) and saved to sahilops.db.`
+                                 : (data.error || 'No account generated — check System Activity Logs.'),
+                            made ? 'success' : 'warning');
+                        await refreshAllData();
+                    } else if (data.status === 'failed') {
+                        setGeneratorPill('FAILED');
+                        setInlineStatus('generator-msg', data.error || 'Generation failed.', 'error');
+                    } else {
+                        setGeneratorPill('READY');
+                        setInlineStatus('generator-msg', 'Generator is idle.');
+                    }
+                } catch (err) {
+                    setGeneratorPill('FAILED');
+                    setInlineStatus('generator-msg', `Status check failed: ${err.message}`, 'error');
+                    finishGeneration();
+                }
+            };
+            poll();
         }
 
         async function fetchStatsAndUptime() {
@@ -709,10 +1063,10 @@
                 });
                 if (!res.ok) return;
                 const stats = await res.json();
-                
+
                 const uptimeSec = stats.uptime || 0;
                 document.getElementById('session-countdown').textContent = formatUptime(uptimeSec);
-                
+
                 const maxCycle = 43200;
                 const pct = Math.min(100, ((uptimeSec % maxCycle) / maxCycle) * 100);
                 document.getElementById('session-progress-bar').style.width = pct + '%';
@@ -787,7 +1141,7 @@
 
                 const logsJson = await logsRes.json();
                 const logsBox = document.getElementById('bot-logs');
-                
+
                 if (logsJson.logs) {
                     if (Array.isArray(logsJson.logs)) {
                         logsBox.innerHTML = logsJson.logs.join('<br>');
@@ -859,7 +1213,7 @@
         async function togglePauseAll() {
             const btn = document.getElementById('pause-toggle-btn');
             const endpoint = isAllPaused ? '/api/account/restart' : '/api/account/pause_all';
-            
+
             try {
                 const res = await fetch(endpoint, {
                     method: 'POST',
@@ -890,10 +1244,16 @@
         }
 
         window.addEventListener('DOMContentLoaded', async () => {
+            await loadGuildConfig();
             await refreshAllData();
 
             if (autoRefreshTimer) clearInterval(autoRefreshTimer);
             autoRefreshTimer = setInterval(refreshAllData, 10000);
+        });
+
+        window.addEventListener('beforeunload', () => {
+            if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+            if (generationPollTimer) clearTimeout(generationPollTimer);
         });
     </script>
 </body>
